@@ -1,0 +1,8 @@
+name = "poppy-auth-api"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[[d1_databases]]
+binding = "users_db"
+database_name = "poppy-users-db"
+database_id = "8b16d66a-c458-489b-8ca4-51c6a2519409"
