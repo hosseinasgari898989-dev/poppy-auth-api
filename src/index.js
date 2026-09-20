@@ -1,7 +1,7 @@
 // ==================================================
 // Poppy Auth API  |  src/index.js
 // Cloudflare Workers + D1 (binding: users_db)
-// @simplewebauthn/server v11+ (v11 / v12 / v13)
+// @simplewebauthn/server  (works with v10 AND v11+)
 // ==================================================
 
 import {
@@ -62,6 +62,11 @@ function b64uDecode(str) {
   const buf = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
   return buf;
+}
+
+// accepts string (already base64url) or bytes
+function toB64u(x) {
+  return typeof x === 'string' ? x : b64uEncode(x);
 }
 
 function randomId(bytes = 16) {
@@ -177,7 +182,7 @@ async function registerBegin(request, env) {
   if (!origin) return json({ error: 'origin_not_allowed' }, 403);
   const rpId = new URL(origin).hostname;
 
-  // v11+: userID must be bytes (Uint8Array)
+  // userID must be bytes (Uint8Array) in v10 and v11+
   const userHandle = crypto.getRandomValues(new Uint8Array(16));
   const userHandleB64 = b64uEncode(userHandle);
 
@@ -234,14 +239,19 @@ async function registerFinish(request, env) {
     return json({ error: 'not_verified' }, 400);
   }
 
-  // v11+: data lives in registrationInfo.credential
-  const cred = verification.registrationInfo.credential;
-  if (!cred || !cred.id || !cred.publicKey) {
-    return json({ error: 'bad_registration_info' }, 500);
+  // Works with both layouts:
+  //  v11+ : info.credential = { id, publicKey, counter }
+  //  v10  : info.credentialID, info.credentialPublicKey, info.counter
+  const info = verification.registrationInfo;
+  const rawId = info.credential ? info.credential.id : info.credentialID;
+  const rawKey = info.credential ? info.credential.publicKey : info.credentialPublicKey;
+  const counter = (info.credential ? info.credential.counter : info.counter) || 0;
+
+  if (!rawId || !rawKey) {
+    return json({ error: 'bad_registration_info', keys: Object.keys(info) }, 500);
   }
-  const credentialIdB64 = cred.id;
-  const publicKeyB64 = b64uEncode(cred.publicKey);
-  const counter = cred.counter || 0;
+  const credentialIdB64 = toB64u(rawId);
+  const publicKeyB64 = toB64u(rawKey);
 
   const dup = await env.users_db
     .prepare('SELECT credential_id FROM credentials WHERE credential_id = ?')
@@ -330,6 +340,9 @@ async function loginFinish(request, env) {
     .first();
   if (!storedCred) return json({ error: 'credential_not_found' }, 400);
 
+  const publicKeyBytes = b64uDecode(storedCred.public_key);
+  const storedCounter = storedCred.counter || 0;
+
   let verification;
   try {
     verification = await verifyAuthenticationResponse({
@@ -337,10 +350,17 @@ async function loginFinish(request, env) {
       expectedChallenge: ch.challenge,
       expectedOrigin: ch.origin,
       expectedRPID: ch.rp_id,
+      // v11+ reads "credential"
       credential: {
         id: storedCred.credential_id,
-        publicKey: b64uDecode(storedCred.public_key),
-        counter: storedCred.counter || 0,
+        publicKey: publicKeyBytes,
+        counter: storedCounter,
+      },
+      // v10 reads "authenticator"
+      authenticator: {
+        credentialID: b64uDecode(storedCred.credential_id),
+        credentialPublicKey: publicKeyBytes,
+        counter: storedCounter,
       },
       requireUserVerification: true,
     });
