@@ -21,13 +21,19 @@ function json(data, status = 200) {
 }
 
 function getOrigin(request) {
-  return request.headers.get('Origin') || new URL(request.url).origin;
+  const origin = request.headers.get('Origin');
+  if (origin && origin !== 'null') return origin;
+  return new URL(request.url).origin;
 }
 
 function getRpId(request) {
-  return new URL(getOrigin(request)).hostname;
+  const origin = getOrigin(request);
+  try {
+    return new URL(origin).hostname;
+  } catch (e) {
+    return new URL(request.url).hostname;
+  }
 }
-
 function b64uEncode(buf) {
   const bytes = new Uint8Array(buf);
   let s = '';
