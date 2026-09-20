@@ -248,10 +248,9 @@ async function loginBegin(request, env) {
     .all();
 
   const allowCredentials = (creds.results || []).map((c) => ({
-    id: c.credential_id,
-    type: 'public-key',
-    transports: ['internal'],
-  }));
+  id: c.credential_id,
+  type: 'public-key',
+}));
 
   const options = await generateAuthenticationOptions({
     rpID: rpId,
