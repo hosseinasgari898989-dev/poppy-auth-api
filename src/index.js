@@ -134,9 +134,9 @@ async function registerBegin(request, env) {
 
   const challengeId = randomId(16);
   await env.users_db
-    .prepare(
-      'INSERT INTO challenges (id, user_id, challenge, type, origin, rp_id, expires_at) VALUES (?, ?, ?, ?, ?, ?, datetime("now", "+10 minutes"))'
-    )
+  .prepare(
+    'INSERT OR REPLACE INTO credentials (credential_id, user_id, public_key, counter, device_info) VALUES (?, ?, ?, ?, ?)'
+  )
     .bind(challengeId, userId, options.challenge, 'register', origin, rpId)
     .run();
 
