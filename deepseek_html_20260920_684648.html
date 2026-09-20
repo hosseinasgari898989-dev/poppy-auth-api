@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>تست ورود با اثر انگشت</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Vazirmatn,system-ui,Tahoma,sans-serif;
+    background:linear-gradient(135deg,#0a0508,#1a0a10 50%,#0a0508);
+    color:#fff;min-height:100vh;padding:20px;
+    display:flex;align-items:center;justify-content:center}
+  .box{max-width:460px;width:100%;background:rgba(20,10,15,.9);
+    border:1px solid rgba(255,60,100,.3);border-radius:20px;
+    padding:26px 22px;box-shadow:0 30px 80px rgba(0,0,0,.6)}
+  h1{margin:0 0 6px;font-size:18px;
+    background:linear-gradient(135deg,#ff4b6e,#ff174d);
+    -webkit-background-clip:text;background-clip:text;
+    -webkit-text-fill-color:transparent;
+    font-family:Oswald,Vazirmatn,sans-serif;letter-spacing:1px}
+  .sub{color:#a899a0;font-size:12px;margin:0 0 20px;line-height:1.7}
+  button{width:100%;padding:14px;border:none;border-radius:12px;
+    font-weight:700;font-size:14px;font-family:inherit;cursor:pointer;
+    transition:.2s;margin-bottom:10px}
+  .primary{background:linear-gradient(135deg,#ff174d,#ff4b6e);color:#fff;
+    box-shadow:0 8px 25px rgba(255,23,77,.35)}
+  .primary:hover:not(:disabled){transform:translateY(-2px)}
+  .primary:disabled{opacity:.4;cursor:not-allowed}
+  .secondary{background:transparent;color:#ff6a88;
+    border:1px solid rgba(255,75,110,.4)}
+  .danger{background:transparent;color:#ff6a88;
+    border:1px solid rgba(255,75,110,.4);font-size:12px;padding:10px}
+  #log{margin-top:14px;padding:12px;background:rgba(0,0,0,.35);
+    border:1px solid rgba(255,60,100,.15);border-radius:12px;
+    font-family:monospace;font-size:11px;line-height:1.8;
+    max-height:300px;overflow-y:auto;display:none;direction:ltr;text-align:left}
+  #log.show{display:block}
+  #log .ok{color:#4bff88}
+  #log .err{color:#ff6a88}
+  #log .info{color:#c4aeb5}
+  #userBox{margin-top:14px;padding:14px;border-radius:12px;
+    background:linear-gradient(135deg,rgba(255,23,77,.15),rgba(255,75,110,.08));
+    border:1px solid rgba(255,75,110,.4);display:none}
+  #userBox.show{display:block}
+  #userBox .lbl{font-size:11px;color:#a899a0;margin-bottom:6px}
+  #userBox .id{font-size:22px;font-weight:900;color:#fff;
+    font-family:Oswald,sans-serif;letter-spacing:2px}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>🔐 تست ورود با اثر انگشت</h1>
+  <p class="sub">Worker: poppy-auth-api</p>
+
+  <button class="primary" id="registerBtn">✨ ثبت‌نام جدید</button>
+  <button class="primary" id="loginBtn">🔓 ورود با اثر انگشت</button>
+  <button class="secondary" id="checkBtn">👤 بررسی وضعیت</button>
+  <button class="danger" id="logoutBtn">🚪 خروج</button>
+
+  <div id="userBox">
+    <div class="lbl">شما وارد شدید به عنوان:</div>
+    <div class="id" id="userId">-</div>
+  </div>
+
+  <div id="log"></div>
+</div>
+
+<script>
+(function(){
+  'use strict';
+
+  var API = 'https://poppy-auth-api.hosseinasgari898989.workers.dev';
+  var TOKEN_KEY = 'poppy_test_token';
+
+  var $ = function(id){ return document.getElementById(id); };
+  var log = $('log');
+
+  function logLine(msg, cls){
+    log.classList.add('show');
+    var div = document.createElement('div');
+    div.className = cls || 'info';
+    div.textContent = msg;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function showUser(displayId){
+    if (displayId){
+      $('userId').textContent = displayId;
+      $('userBox').classList.add('show');
+    } else {
+      $('userBox').classList.remove('show');
+    }
+  }
+
+  // ===== WebAuthn helpers =====
+  function b64uDecode(str){
+    str = String(str).replace(/-/g,'+').replace(/_/g,'/');
+    while (str.length % 4) str += '=';
+    var bin = atob(str);
+    var buf = new Uint8Array(bin.length);
+    for (var i=0;i<bin.length;i++) buf[i] = bin.charCodeAt(i);
+    return buf;
+  }
+
+  function b64uEncode(buf){
+    var bytes = new Uint8Array(buf);
+    var s = '';
+    for (var i=0;i<bytes.length;i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+  }
+
+  // ===== ثبت‌نام =====
+  $('registerBtn').onclick = async function(){
+    log.classList.add('show');
+    logLine('=== شروع ثبت‌نام ===','info');
+    var btn = this;
+    btn.disabled = true;
+
+    try {
+      // 1. begin
+      logLine('1) درخواست چالش...','info');
+      var res = await fetch(API + '/api/auth/register/begin', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: '{}'
+      });
+      var data = await res.json();
+      if (!data.success){ logLine('خطا: ' + JSON.stringify(data),'err'); btn.disabled=false; return; }
+      logLine('2) چالش دریافت شد: ' + data.challengeId,'ok');
+
+      // 2. decode challenge
+      var opts = data.options;
+      opts.challenge = b64uDecode(opts.challenge);
+      opts.user.id = b64uDecode(opts.user.id);
+
+      // 3. create credential
+      logLine('3) درخواست اثر انگشت...','info');
+      var credential = await navigator.credentials.create({ publicKey: opts });
+      logLine('4) اثر انگشت تایید شد ✅','ok');
+
+      // 4. prepare for sending
+      var credForSend = {
+        id: credential.id,
+        rawId: b64uEncode(credential.rawId),
+        type: credential.type,
+        response: {
+          attestationObject: b64uEncode(credential.response.attestationObject),
+          clientDataJSON: b64uEncode(credential.response.clientDataJSON),
+        },
+        clientExtensionResults: credential.getClientExtensionResults ? credential.getClientExtensionResults() : {},
+      };
+      // transports
+      if (credential.response.getTransports){
+        credForSend.response.transports = credential.response.getTransports();
+      }
+
+      // 5. finish
+      logLine('5) ارسال به سرور...','info');
+      var res2 = await fetch(API + '/api/auth/register/finish', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ challengeId: data.challengeId, credential: credForSend })
+      });
+      var data2 = await res2.json();
+      if (!data2.success){ logLine('خطا: ' + JSON.stringify(data2),'err'); btn.disabled=false; return; }
+
+      localStorage.setItem(TOKEN_KEY, data2.token);
+      logLine('6) ثبت‌نام موفق ✅','ok');
+      logLine('شناسه شما: ' + data2.user.displayId,'ok');
+      showUser(data2.user.displayId);
+
+    } catch(e){
+      logLine('خطا: ' + e.message,'err');
+    }
+
+    btn.disabled = false;
+  };
+
+  // ===== ورود =====
+  $('loginBtn').onclick = async function(){
+    log.classList.add('show');
+    logLine('=== شروع ورود ===','info');
+    var btn = this;
+    btn.disabled = true;
+
+    try {
+      logLine('1) درخواست چالش...','info');
+      var res = await fetch(API + '/api/auth/login/begin', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: '{}'
+      });
+      var data = await res.json();
+      if (!data.success){ logLine('خطا: ' + JSON.stringify(data),'err'); btn.disabled=false; return; }
+      logLine('2) چالش دریافت شد','ok');
+
+      var opts = data.options;
+      opts.challenge = b64uDecode(opts.challenge);
+      if (opts.allowCredentials){
+        opts.allowCredentials = opts.allowCredentials.map(function(c){
+          return { id: b64uDecode(c.id), type: c.type, transports: c.transports };
+        });
+      }
+
+      logLine('3) درخواست اثر انگشت...','info');
+      var assertion = await navigator.credentials.get({ publicKey: opts });
+      logLine('4) اثر انگشت تایید شد ✅','ok');
+
+      var credForSend = {
+        id: assertion.id,
+        rawId: b64uEncode(assertion.rawId),
+        type: assertion.type,
+        response: {
+          authenticatorData: b64uEncode(assertion.response.authenticatorData),
+          clientDataJSON: b64uEncode(assertion.response.clientDataJSON),
+          signature: b64uEncode(assertion.response.signature),
+          userHandle: assertion.response.userHandle ? b64uEncode(assertion.response.userHandle) : null,
+        },
+        clientExtensionResults: assertion.getClientExtensionResults ? assertion.getClientExtensionResults() : {},
+      };
+
+      logLine('5) ارسال به سرور...','info');
+      var res2 = await fetch(API + '/api/auth/login/finish', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ challengeId: data.challengeId, credential: credForSend })
+      });
+      var data2 = await res2.json();
+      if (!data2.success){ logLine('خطا: ' + JSON.stringify(data2),'err'); btn.disabled=false; return; }
+
+      localStorage.setItem(TOKEN_KEY, data2.token);
+      logLine('6) ورود موفق ✅','ok');
+      logLine('شناسه شما: ' + data2.user.displayId,'ok');
+      showUser(data2.user.displayId);
+
+    } catch(e){
+      logLine('خطا: ' + e.message,'err');
+    }
+
+    btn.disabled = false;
+  };
+
+  // ===== بررسی وضعیت =====
+  $('checkBtn').onclick = async function(){
+    log.classList.add('show');
+    var token = localStorage.getItem(TOKEN_KEY);
+    if (!token){ logLine('توکنی موجود نیست','err'); return; }
+
+    logLine('=== بررسی وضعیت ===','info');
+    try {
+      var res = await fetch(API + '/api/auth/me', {
+        headers: { 'Authorization': 'Bearer ' + token }
+      });
+      var data = await res.json();
+      if (!data.success){ logLine('خطا: ' + JSON.stringify(data),'err'); showUser(null); return; }
+      logLine('شما وارد شدید به عنوان: ' + data.user.displayId,'ok');
+      showUser(data.user.displayId);
+    } catch(e){
+      logLine('خطا: ' + e.message,'err');
+    }
+  };
+
+  // ===== خروج =====
+  $('logoutBtn').onclick = async function(){
+    var token = localStorage.getItem(TOKEN_KEY);
+    if (!token){ logLine('توکنی موجود نیست','err'); return; }
+
+    try {
+      await fetch(API + '/api/auth/logout', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + token }
+      });
+    } catch(e){}
+
+    localStorage.removeItem(TOKEN_KEY);
+    showUser(null);
+    logLine('خارج شدید ✅','ok');
+  };
+
+  // ===== بررسی اولیه =====
+  (async function init(){
+    var token = localStorage.getItem(TOKEN_KEY);
+    if (!token) return;
+    try {
+      var res = await fetch(API + '/api/auth/me', {
+        headers: { 'Authorization': 'Bearer ' + token }
+      });
+      var data = await res.json();
+      if (data.success){
+        logLine('شما وارد هستید: ' + data.user.displayId,'ok');
+        showUser(data.user.displayId);
+      }
+    } catch(e){}
+  })();
+
+})();
+</script>
+</body>
+</html>
