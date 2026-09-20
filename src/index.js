@@ -1,7 +1,7 @@
 // ==================================================
 // Poppy Auth API  |  src/index.js
 // Cloudflare Workers + D1 (binding: users_db)
-// @simplewebauthn/server v10
+// @simplewebauthn/server v11+ (v11 / v12 / v13)
 // ==================================================
 
 import {
@@ -62,11 +62,6 @@ function b64uDecode(str) {
   const buf = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
   return buf;
-}
-
-// accepts string (already base64url) or bytes
-function toB64u(x) {
-  return typeof x === 'string' ? x : b64uEncode(x);
 }
 
 function randomId(bytes = 16) {
@@ -182,13 +177,15 @@ async function registerBegin(request, env) {
   if (!origin) return json({ error: 'origin_not_allowed' }, 403);
   const rpId = new URL(origin).hostname;
 
-  const webauthnUserId = randomId(16);
+  // v11+: userID must be bytes (Uint8Array)
+  const userHandle = crypto.getRandomValues(new Uint8Array(16));
+  const userHandleB64 = b64uEncode(userHandle);
 
   const options = await generateRegistrationOptions({
     rpName: RP_NAME,
     rpID: rpId,
-    userID: webauthnUserId,
-    userName: 'poppy-' + webauthnUserId.slice(0, 6),
+    userID: userHandle,
+    userName: 'poppy-' + userHandleB64.slice(0, 6),
     userDisplayName: 'Poppy User',
     attestationType: 'none',
     timeout: WEBAUTHN_TIMEOUT,
@@ -203,7 +200,7 @@ async function registerBegin(request, env) {
   const challengeId = randomId(16);
   await saveChallenge(env, {
     id: challengeId,
-    userId: webauthnUserId,
+    userId: userHandleB64,
     challenge: options.challenge,
     type: 'register',
     origin,
@@ -237,9 +234,14 @@ async function registerFinish(request, env) {
     return json({ error: 'not_verified' }, 400);
   }
 
-  const info = verification.registrationInfo;
-  const credentialIdB64 = toB64u(info.credentialID);
-  const publicKeyB64 = toB64u(info.credentialPublicKey);
+  // v11+: data lives in registrationInfo.credential
+  const cred = verification.registrationInfo.credential;
+  if (!cred || !cred.id || !cred.publicKey) {
+    return json({ error: 'bad_registration_info' }, 500);
+  }
+  const credentialIdB64 = cred.id;
+  const publicKeyB64 = b64uEncode(cred.publicKey);
+  const counter = cred.counter || 0;
 
   const dup = await env.users_db
     .prepare('SELECT credential_id FROM credentials WHERE credential_id = ?')
@@ -272,7 +274,7 @@ async function registerFinish(request, env) {
       .prepare(
         'INSERT INTO credentials (credential_id, user_id, public_key, counter, device_info) VALUES (?, (SELECT id FROM users WHERE display_id = ?), ?, ?, ?)'
       )
-      .bind(credentialIdB64, displayId, publicKeyB64, info.counter || 0, userAgent),
+      .bind(credentialIdB64, displayId, publicKeyB64, counter, userAgent),
   ]);
 
   const user = await env.users_db
@@ -335,9 +337,9 @@ async function loginFinish(request, env) {
       expectedChallenge: ch.challenge,
       expectedOrigin: ch.origin,
       expectedRPID: ch.rp_id,
-      authenticator: {
-        credentialID: b64uDecode(storedCred.credential_id),
-        credentialPublicKey: b64uDecode(storedCred.public_key),
+      credential: {
+        id: storedCred.credential_id,
+        publicKey: b64uDecode(storedCred.public_key),
         counter: storedCred.counter || 0,
       },
       requireUserVerification: true,
