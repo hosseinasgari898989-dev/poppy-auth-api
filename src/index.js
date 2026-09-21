@@ -31,7 +31,7 @@ const ALLOWED_ORIGINS = [
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Token',
 };
 
 // User-facing messages (Persian, simple)
@@ -303,6 +303,162 @@ function extractRegistration(verification) {
 }
 
 // ==================================================
+ // 3.5) OWNER ADMIN HELPERS
+ // ==================================================
+ function isOwnerAdmin(request, env) {
+   const configured = env.AUTH_ADMIN_TOKEN || '';
+   const token = request.headers.get('X-Admin-Token') || '';
+   return !!configured && token === configured;
+ }
+
+ function adminUnauthorized() {
+   return fail('unauthorized', 401, 'دسترسی مدیریت نیاز به کلید معتبر دارد.');
+ }
+
+ function parseUserId(path) {
+   const m = path.match(/^\/api\/admin\/users\/([^/]+)/);
+   return m ? decodeURIComponent(m[1]) : null;
+ }
+
+ async function adminListUsers(request, env) {
+   const url = new URL(request.url);
+   const limitParam = Number.parseInt(url.searchParams.get('limit') || '200', 10);
+   const limit = Math.min(Math.max(Number.isFinite(limitParam) ? limitParam : 200, 1), 500);
+   const search = (url.searchParams.get('search') || '').trim();
+
+   let query = `
+     SELECT
+       u.id,
+       u.display_id,
+       u.status,
+       u.trust_level,
+       u.last_login,
+       u.created_at,
+       (SELECT COUNT(*) FROM credentials c WHERE c.user_id = u.id) AS credential_count,
+       (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > datetime('now')) AS active_session_count,
+       EXISTS(SELECT 1 FROM recovery_codes r WHERE r.user_id = u.id) AS has_recovery
+     FROM users u
+   `;
+   const binds = [];
+   if (search) {
+     query += ' WHERE u.display_id LIKE ? OR CAST(u.id AS TEXT) LIKE ?';
+     binds.push('%' + search + '%', '%' + search + '%');
+   }
+   query += ' ORDER BY u.id ASC LIMIT ?';
+   binds.push(limit);
+
+   const { results } = await env.users_db.prepare(query).bind(...binds).all();
+   const users = (results || []).map((r) => ({
+     id: r.id,
+     displayId: r.display_id,
+     status: r.status,
+     trustLevel: r.trust_level,
+     lastLogin: r.last_login || null,
+     createdAt: r.created_at || null,
+     credentialCount: Number(r.credential_count || 0),
+     activeSessionCount: Number(r.active_session_count || 0),
+     hasRecovery: !!r.has_recovery,
+   }));
+   return json({ success: true, users });
+ }
+
+ async function adminUserDetail(request, env, userId) {
+   const user = await env.users_db
+     .prepare('SELECT id, display_id, status, trust_level, last_login, created_at FROM users WHERE id = ?')
+     .bind(userId)
+     .first();
+   if (!user) return fail('user_not_found', 404, MSG.noUser);
+
+   const creds = await env.users_db
+     .prepare('SELECT credential_id, counter, device_info, last_used FROM credentials WHERE user_id = ? ORDER BY id ASC')
+     .bind(userId)
+     .all();
+
+   const sessions = await env.users_db
+     .prepare("SELECT token, expires_at, user_agent FROM sessions WHERE user_id = ? AND expires_at > datetime('now') ORDER BY expires_at DESC")
+     .bind(userId)
+     .all();
+
+   return json({
+     success: true,
+     user: {
+       id: user.id,
+       displayId: user.display_id,
+       status: user.status,
+       trustLevel: user.trust_level,
+       lastLogin: user.last_login || null,
+       createdAt: user.created_at || null,
+       credentialCount: (creds.results || []).length,
+       activeSessionCount: (sessions.results || []).length,
+       credentials: (creds.results || []).map((r) => ({
+         credentialId: r.credential_id,
+         counter: r.counter || 0,
+         deviceInfo: r.device_info || '',
+         lastUsed: r.last_used || null,
+       })),
+       sessions: (sessions.results || []).map((r) => ({
+         expiresAt: r.expires_at || null,
+         userAgent: r.user_agent || '',
+       })),
+     },
+   });
+ }
+
+ async function adminSetUserStatus(env, userId, status) {
+   if (!['active', 'disabled'].includes(status)) {
+     return fail('invalid_status', 400, 'وضعیت حساب نامعتبر است.');
+   }
+   const exists = await env.users_db.prepare('SELECT id FROM users WHERE id = ?').bind(userId).first();
+   if (!exists) return fail('user_not_found', 404, MSG.noUser);
+
+   await env.users_db.prepare('UPDATE users SET status = ? WHERE id = ?').bind(status, userId).run();
+   if (status === 'disabled') {
+     await env.users_db.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId).run();
+   }
+   return json({ success: true, status });
+ }
+
+ async function adminRevokeSessions(env, userId) {
+   const exists = await env.users_db.prepare('SELECT id FROM users WHERE id = ?').bind(userId).first();
+   if (!exists) return fail('user_not_found', 404, MSG.noUser);
+   const result = await env.users_db.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId).run();
+   return json({ success: true, count: Number((result.meta && result.meta.changes) || 0) });
+ }
+
+ async function adminRemoveCredential(env, userId, credentialId) {
+   const user = await env.users_db.prepare('SELECT id FROM users WHERE id = ?').bind(userId).first();
+   if (!user) return fail('user_not_found', 404, MSG.noUser);
+
+   const countRow = await env.users_db
+     .prepare('SELECT COUNT(*) AS n FROM credentials WHERE user_id = ?')
+     .bind(userId)
+     .first();
+   const count = Number((countRow && countRow.n) || 0);
+   if (count <= 1) {
+     return fail('last_credential', 400, 'برای امنیت، آخرین Passkey حذف نمی‌شود.');
+   }
+
+   const result = await env.users_db
+     .prepare('DELETE FROM credentials WHERE user_id = ? AND credential_id = ?')
+     .bind(userId, credentialId)
+     .run();
+
+   if (!result.meta || Number(result.meta.changes || 0) !== 1) {
+     return fail('credential_not_found', 404, 'Passkey پیدا نشد.');
+   }
+   return json({ success: true });
+ }
+
+ async function adminRegenerateRecovery(env, userId) {
+   const user = await env.users_db.prepare('SELECT id, status FROM users WHERE id = ?').bind(userId).first();
+   if (!user) return fail('user_not_found', 404, MSG.noUser);
+   if (user.status !== 'active') return fail('account_disabled', 403, MSG.disabled);
+   const recoveryCode = await issueRecoveryCode(env, userId);
+   if (!recoveryCode) return fail('recovery_unavailable', 503, MSG.server);
+   return json({ success: true, recoveryCode });
+ }
+ 
+ // ==================================================
 // 4) ROUTER
 // ==================================================
 export default {
@@ -334,6 +490,41 @@ export default {
 
       if (path === '/api/auth/me' && method === 'GET') return await me(request, env);
       if (path === '/api/auth/logout' && method === 'POST') return await logout(request, env);
+
+      // ----- owner admin endpoints -----
+      if (path.startsWith('/api/admin/')) {
+        if (!isOwnerAdmin(request, env)) return adminUnauthorized();
+
+        if (path === '/api/admin/login' && method === 'POST') {
+          return json({ success: true });
+        }
+        if (path === '/api/admin/users' && method === 'GET') {
+          return await adminListUsers(request, env);
+        }
+
+        const userId = parseUserId(path);
+        if (!userId) return fail('not_found', 404, MSG.notFound);
+
+        if (path === `/api/admin/users/${encodeURIComponent(userId)}` && method === 'GET') {
+          return await adminUserDetail(request, env, userId);
+        }
+        if (path === `/api/admin/users/${encodeURIComponent(userId)}/status` && method === 'POST') {
+          const body = await readJson(request);
+          return await adminSetUserStatus(env, userId, body && body.status);
+        }
+        if (path === `/api/admin/users/${encodeURIComponent(userId)}/revoke-sessions` && method === 'POST') {
+          return await adminRevokeSessions(env, userId);
+        }
+        if (path.startsWith(`/api/admin/users/${encodeURIComponent(userId)}/credentials/`) && method === 'DELETE') {
+          const credentialId = decodeURIComponent(path.split('/').pop() || '');
+          return await adminRemoveCredential(env, userId, credentialId);
+        }
+        if (path === `/api/admin/users/${encodeURIComponent(userId)}/recovery/regenerate` && method === 'POST') {
+          return await adminRegenerateRecovery(env, userId);
+        }
+
+        return fail('not_found', 404, MSG.notFound);
+      }
 
       // ----- new endpoints -----
       if (path === '/api/auth/recovery/login' && method === 'POST') return await recoveryLogin(request, env);
