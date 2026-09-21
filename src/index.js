@@ -352,6 +352,22 @@ export default {
 // ==================================================
 // 5) REGISTER
 // ==================================================
+async function ensureRegistrationGate(env) {
+  await env.users_db.prepare(
+    `CREATE TABLE IF NOT EXISTS registration_gate (
+      id INTEGER PRIMARY KEY CHECK (id = 1)
+    )`
+  ).run();
+}
+
+async function claimInitialRegistration(env) {
+  await ensureRegistrationGate(env);
+  const result = await env.users_db.prepare(
+    'INSERT OR IGNORE INTO registration_gate (id) VALUES (1)'
+  ).run();
+  return !!(result.meta && Number(result.meta.changes || 0) === 1);
+}
+
 async function registerBegin(request, env) {
   const rate = await guardRateLimit(request, env, 'register-begin', 3, 10 * 60 * 1000);
   if (rate) return rate;
@@ -452,19 +468,31 @@ async function registerFinish(request, env) {
   }
   if (!displayId) return fail('id_generation_failed', 500, MSG.server);
 
+  const claimed = await claimInitialRegistration(env);
+  if (!claimed) return fail('registration_closed', 403, MSG.registrationClosed);
+
   const userAgent = request.headers.get('User-Agent') || '';
 
   // user + credential in one transaction
-  await env.users_db.batch([
-    env.users_db
-      .prepare('INSERT INTO users (display_id, status, trust_level) VALUES (?, ?, ?)')
-      .bind(displayId, 'active', 'new'),
-    env.users_db
-      .prepare(
-        'INSERT INTO credentials (credential_id, user_id, public_key, counter, device_info) VALUES (?, (SELECT id FROM users WHERE display_id = ?), ?, ?, ?)'
-      )
-      .bind(reg.credentialIdB64, displayId, reg.publicKeyB64, reg.counter, userAgent),
-  ]);
+  try {
+    await env.users_db.batch([
+      env.users_db
+        .prepare('INSERT INTO users (display_id, status, trust_level) VALUES (?, ?, ?)')
+        .bind(displayId, 'active', 'new'),
+      env.users_db
+        .prepare(
+          'INSERT INTO credentials (credential_id, user_id, public_key, counter, device_info) VALUES (?, (SELECT id FROM users WHERE display_id = ?), ?, ?, ?)'
+        )
+        .bind(reg.credentialIdB64, displayId, reg.publicKeyB64, reg.counter, userAgent),
+    ]);
+  } catch (e) {
+    try {
+      await env.users_db.prepare('DELETE FROM registration_gate WHERE id = 1').run();
+    } catch (cleanupError) {
+      console.error('registration_gate_cleanup_failed', cleanupError);
+    }
+    throw e;
+  }
 
   const user = await env.users_db
     .prepare('SELECT id, display_id FROM users WHERE display_id = ?')
