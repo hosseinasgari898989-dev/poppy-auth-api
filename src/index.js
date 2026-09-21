@@ -370,7 +370,7 @@ function extractRegistration(verification) {
    if (!user) return fail('user_not_found', 404, MSG.noUser);
 
    const creds = await env.users_db
-     .prepare('SELECT credential_id, counter, device_info, last_used FROM credentials WHERE user_id = ? ORDER BY id ASC')
+     .prepare('SELECT credential_id, counter, device_info, last_used FROM credentials WHERE user_id = ? ORDER BY credential_id ASC')
      .bind(userId)
      .all();
 
