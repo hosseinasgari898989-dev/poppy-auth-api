@@ -49,6 +49,8 @@ const MSG = {
   disabled: 'این حساب غیرفعال شده است.',
   notLoggedIn: 'وارد نشده‌ای یا مدت نشست تمام شده. دوباره وارد شو.',
   badRecovery: 'کد بازیابی درست نیست. با دقت دوباره وارد کن.',
+  registrationClosed: 'ثبت‌نام حساب جدید بسته است. با حساب موجود وارد شو و از گزینه افزودن دستگاه استفاده کن.',
+  rateLimited: 'تعداد تلاش‌ها زیاد است. چند دقیقه بعد دوباره امتحان کن.',
   notFound: 'آدرس پیدا نشد.',
 };
 
@@ -117,6 +119,61 @@ async function readJson(request) {
 function getToken(request) {
   const auth = request.headers.get('Authorization') || '';
   return auth.replace(/^Bearer\s+/i, '').trim();
+}
+
+async function ensureRateLimitTable(env) {
+  await env.users_db.prepare(
+    `CREATE TABLE IF NOT EXISTS auth_rate_limits (
+      key TEXT PRIMARY KEY,
+      window_start INTEGER NOT NULL,
+      count INTEGER NOT NULL
+    )`
+  ).run();
+}
+
+function clientKey(request, scope) {
+  const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown';
+  return scope + ':' + ip;
+}
+
+async function takeRateLimit(env, key, limit, windowMs) {
+  await ensureRateLimitTable(env);
+  const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
+  const row = await env.users_db
+    .prepare('SELECT window_start, count FROM auth_rate_limits WHERE key = ?')
+    .bind(key)
+    .first();
+
+  if (!row || Number(row.window_start) !== windowStart) {
+    await env.users_db.prepare(
+      `INSERT INTO auth_rate_limits (key, window_start, count) VALUES (?, ?, 1)
+       ON CONFLICT(key) DO UPDATE SET window_start = excluded.window_start, count = 1`
+    ).bind(key, windowStart).run();
+    return { allowed: true, retryAfter: Math.ceil((windowStart + windowMs - Date.now()) / 1000) };
+  }
+
+  if (Number(row.count) >= limit) {
+    return { allowed: false, retryAfter: Math.max(1, Math.ceil((windowStart + windowMs - Date.now()) / 1000)) };
+  }
+
+  await env.users_db
+    .prepare('UPDATE auth_rate_limits SET count = count + 1 WHERE key = ? AND window_start = ?')
+    .bind(key, windowStart).run();
+
+  return { allowed: true, retryAfter: Math.ceil((windowStart + windowMs - Date.now()) / 1000) };
+}
+
+async function guardRateLimit(request, env, scope, limit, windowMs) {
+  try {
+    const r = await takeRateLimit(env, clientKey(request, scope), limit, windowMs);
+    if (!r.allowed) {
+      return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: r.retryAfter });
+    }
+    return null;
+  } catch (e) {
+    console.error('rate_limit_error', scope, e);
+    return fail('rate_limit_unavailable', 503, MSG.server);
+  }
 }
 
 // ---------- recovery code helpers ----------
@@ -296,8 +353,17 @@ export default {
 // 5) REGISTER
 // ==================================================
 async function registerBegin(request, env) {
+  const rate = await guardRateLimit(request, env, 'register-begin', 3, 10 * 60 * 1000);
+  if (rate) return rate;
+
   const origin = getOrigin(request);
   if (!origin) return fail('origin_not_allowed', 403, MSG.origin);
+
+  const countRow = await env.users_db.prepare('SELECT COUNT(*) AS count FROM users').first();
+  if (!countRow || Number(countRow.count || 0) > 0) {
+    return fail('registration_closed', 403, MSG.registrationClosed);
+  }
+
   const rpId = new URL(origin).hostname;
 
   // userID must be bytes (Uint8Array)
@@ -334,12 +400,20 @@ async function registerBegin(request, env) {
 }
 
 async function registerFinish(request, env) {
+  const rate = await guardRateLimit(request, env, 'register-finish', 6, 10 * 60 * 1000);
+  if (rate) return rate;
+
   const body = await readJson(request);
   const { challengeId, credential } = body || {};
   if (!challengeId || !credential) return fail('missing_fields', 400, MSG.fields);
 
   const ch = await takeChallenge(env, challengeId, 'register');
   if (!ch) return fail('challenge_not_found_or_expired', 400, MSG.challenge);
+
+  const countRow = await env.users_db.prepare('SELECT COUNT(*) AS count FROM users').first();
+  if (!countRow || Number(countRow.count || 0) > 0) {
+    return fail('registration_closed', 403, MSG.registrationClosed);
+  }
 
   let verification;
   try {
@@ -413,6 +487,9 @@ async function registerFinish(request, env) {
 // 6) LOGIN
 // ==================================================
 async function loginBegin(request, env) {
+  const rate = await guardRateLimit(request, env, 'login-begin', 12, 10 * 60 * 1000);
+  if (rate) return rate;
+
   const origin = getOrigin(request);
   if (!origin) return fail('origin_not_allowed', 403, MSG.origin);
   const rpId = new URL(origin).hostname;
@@ -447,6 +524,9 @@ async function loginBegin(request, env) {
 }
 
 async function loginFinish(request, env) {
+  const rate = await guardRateLimit(request, env, 'login-finish', 12, 60 * 1000);
+  if (rate) return rate;
+
   const body = await readJson(request);
   const { challengeId, credential } = body || {};
   if (!challengeId || !credential || !credential.id) return fail('missing_fields', 400, MSG.fields);
@@ -558,6 +638,9 @@ async function logout(request, env) {
 // ==================================================
 // login with recovery code; the used code is replaced by a new one
 async function recoveryLogin(request, env) {
+  const rate = await guardRateLimit(request, env, 'recovery-login', 5, 15 * 60 * 1000);
+  if (rate) return rate;
+
   const body = await readJson(request);
   const norm = normalizeRecoveryCode(body && body.code);
   if (norm.length !== 25) return fail('invalid_recovery_code', 400, MSG.badRecovery);
@@ -599,6 +682,9 @@ async function recoveryLogin(request, env) {
 
 // logged-in user makes a fresh code (old one stops working)
 async function recoveryRegenerate(request, env) {
+  const rate = await guardRateLimit(request, env, 'recovery-regenerate', 3, 60 * 60 * 1000);
+  if (rate) return rate;
+
   const s = await getSessionUser(request, env);
   if (s.error) return s.error;
 
@@ -612,6 +698,9 @@ async function recoveryRegenerate(request, env) {
 // 9) ADD NEW DEVICE / PASSKEY (new, needs Bearer token)
 // ==================================================
 async function addCredentialBegin(request, env) {
+  const rate = await guardRateLimit(request, env, 'credential-add-begin', 5, 15 * 60 * 1000);
+  if (rate) return rate;
+
   const s = await getSessionUser(request, env);
   if (s.error) return s.error;
 
@@ -661,6 +750,9 @@ async function addCredentialBegin(request, env) {
 }
 
 async function addCredentialFinish(request, env) {
+  const rate = await guardRateLimit(request, env, 'credential-add-finish', 8, 15 * 60 * 1000);
+  if (rate) return rate;
+
   const s = await getSessionUser(request, env);
   if (s.error) return s.error;
 
