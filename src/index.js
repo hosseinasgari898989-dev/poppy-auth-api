@@ -21,6 +21,7 @@ const WEBAUTHN_TIMEOUT = 120000;
 const CHALLENGE_TTL = '+10 minutes';
 const SESSION_TTL = '+30 days';
 const MAX_CREDENTIAL_HINTS = 20;
+const GOOGLE_CLIENT_ID = '246560188376-prs0mf954qddb937v04s7krimjul9845.apps.googleusercontent.com';
 
 // Only these origins may register / login (no trailing slash).
 const ALLOWED_ORIGINS = [
@@ -85,7 +86,7 @@ async function ensureGoogleIdentityTables(env) {
 }
 
 async function verifyGoogleIdToken(idToken, env) {
-  const clientId = String(env.GOOGLE_CLIENT_ID || '').trim();
+  const clientId = String(env.GOOGLE_CLIENT_ID || GOOGLE_CLIENT_ID || '').trim();
   if (!clientId) return { error: 'google_not_configured' };
   if (!idToken || typeof idToken !== 'string' || idToken.length < 100) return { error: 'invalid_google_credential' };
   try {
@@ -521,7 +522,7 @@ export default {
 
       // ----- existing endpoints -----
       if (path === '/api/auth/google/config' && method === 'GET') {
-        const clientId = String(env.GOOGLE_CLIENT_ID || '').trim();
+        const clientId = String(env.GOOGLE_CLIENT_ID || GOOGLE_CLIENT_ID || '').trim();
         if (!clientId) return fail('google_not_configured', 503, MSG.googleNotConfigured);
         return json({ success: true, clientId });
       }
