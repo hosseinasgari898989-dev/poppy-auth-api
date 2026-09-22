@@ -617,7 +617,7 @@ async function registerBegin(request, env) {
     userDisplayName: google.name || google.email,
     attestationType: 'none',
     timeout: WEBAUTHN_TIMEOUT,
-    authenticatorSelection: { userVerification: 'required', residentKey: 'preferred' },
+    authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'preferred' },
     supportedAlgorithmIDs: [-7, -257],
   });
   const challengeId = randomId(16);
