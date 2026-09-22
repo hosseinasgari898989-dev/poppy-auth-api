@@ -251,7 +251,7 @@ async function sha256Hex(text) {
   return hex;
 }
 
-const PASSWORD_ITERATIONS = 120000;
+const PASSWORD_ITERATIONS = 100000; // Cloudflare Workers PBKDF2 limit
 const PASSWORD_MIN_LENGTH = 10;
 const PASSWORD_MAX_LENGTH = 128;
 
