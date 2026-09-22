@@ -612,11 +612,6 @@ async function registerFinish(request, env) {
   const ch = await takeChallenge(env, challengeId, 'register');
   if (!ch) return fail('challenge_not_found_or_expired', 400, MSG.challenge);
 
-  const countRow = await env.users_db.prepare('SELECT COUNT(*) AS count FROM users').first();
-  if (!countRow || Number(countRow.count || 0) > 0) {
-    return fail('registration_closed', 403, MSG.registrationClosed);
-  }
-
   let verification;
   try {
     verification = await verifyRegistrationResponse({
