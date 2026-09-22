@@ -63,7 +63,7 @@ const MSG = {
   googleInvalid: 'حساب Google قابل تأیید نبود. دوباره انتخابش کن.',
   googleAccountExists: 'این Google Account قبلاً به یک حساب Playtime Channel متصل شده است. برای ورود از همان حساب Google استفاده کن.',
   googleAlreadyLinked: 'این حساب Poppy از قبل به یک Google Account وصل است.',
-  googleAccountNotLinked: 'این حساب Google هنوز به حساب Poppy وصل نشده است.',
+  googleAccountNotLinked: 'این Google Account هنوز به یک حساب Playtime Channel متصل نیست. برای اولین ورود، با کد بازیابی وارد حساب شو و بعد Google را از مرکز حساب متصل کن.',
   rateLimited: 'تعداد تلاش‌ها زیاد است. چند دقیقه بعد دوباره امتحان کن.',
   notFound: 'آدرس پیدا نشد.',
 };
