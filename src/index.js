@@ -53,7 +53,7 @@ const MSG = {
   registrationClosed: 'ثبت‌نام حساب جدید بسته است. با حساب موجود وارد شو و از گزینه افزودن دستگاه استفاده کن.',
   googleNotConfigured: 'ورود با Google هنوز در سرور تنظیم نشده است.',
   googleInvalid: 'حساب Google قابل تأیید نبود. دوباره انتخابش کن.',
-  googleAccountExists: 'این حساب Google قبلاً یک حساب Poppy دارد. با همان حساب وارد شو و دستگاه جدید را اضافه کن.',
+  googleAccountExists: 'این Google Account قبلاً به یک حساب Playtime Channel متصل شده است. برای ورود از همان حساب Google استفاده کن.',
   googleAlreadyLinked: 'این حساب Poppy از قبل به یک Google Account وصل است.',
   googleAccountNotLinked: 'این حساب Google هنوز به حساب Poppy وصل نشده است.',
   rateLimited: 'تعداد تلاش‌ها زیاد است. چند دقیقه بعد دوباره امتحان کن.',
