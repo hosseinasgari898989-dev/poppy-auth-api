@@ -55,6 +55,7 @@ const MSG = {
   googleInvalid: 'حساب Google قابل تأیید نبود. دوباره انتخابش کن.',
   googleAccountExists: 'این حساب Google قبلاً یک حساب Poppy دارد. با همان حساب وارد شو و دستگاه جدید را اضافه کن.',
   googleAlreadyLinked: 'این حساب Poppy از قبل به یک Google Account وصل است.',
+  googleAccountNotLinked: 'این حساب Google هنوز به حساب Poppy وصل نشده است.',
   rateLimited: 'تعداد تلاش‌ها زیاد است. چند دقیقه بعد دوباره امتحان کن.',
   notFound: 'آدرس پیدا نشد.',
 };
@@ -527,6 +528,8 @@ export default {
         return json({ success: true, clientId });
       }
       if (path === '/api/auth/google/link' && method === 'POST') return await linkGoogle(request, env);
+      if (path === '/api/auth/google/signup' && method === 'POST') return await googleSignup(request, env);
+      if (path === '/api/auth/google/login' && method === 'POST') return await googleLogin(request, env);
       if (path === '/api/auth/register/begin' && method === 'POST') {
         ctx.waitUntil(cleanup(env).catch(() => {}));
         return await registerBegin(request, env);
@@ -590,6 +593,113 @@ export default {
     }
   },
 };
+
+// ==================================================
+/* Google primary authentication: no mandatory WebAuthn */
+async function googleSignup(request, env) {
+  const body = await readJson(request);
+  const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
+  if (google.error) {
+    return fail(
+      google.error,
+      google.error === 'google_not_configured' ? 503 : 401,
+      google.error === 'google_not_configured' ? MSG.googleNotConfigured : MSG.googleInvalid
+    );
+  }
+
+  await ensureGoogleIdentityTables(env);
+
+  const rate = await takeRateLimit(env, 'google-signup:' + google.sub, 6, 10 * 60 * 1000);
+  if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
+
+  const existing = await env.users_db
+    .prepare('SELECT user_id FROM google_identities WHERE google_sub = ?')
+    .bind(google.sub)
+    .first();
+  if (existing) return fail('google_account_exists', 409, MSG.googleAccountExists);
+
+  let displayId = null;
+  for (let i = 0; i < 10; i++) {
+    const id = generateDisplayId();
+    const exists = await env.users_db.prepare('SELECT id FROM users WHERE display_id = ?').bind(id).first();
+    if (!exists) { displayId = id; break; }
+  }
+  if (!displayId) return fail('id_generation_failed', 500, MSG.server);
+
+  try {
+    await env.users_db.batch([
+      env.users_db
+        .prepare('INSERT INTO users (display_id, status, trust_level) VALUES (?, ?, ?)')
+        .bind(displayId, 'active', 'new'),
+      env.users_db
+        .prepare('INSERT INTO google_identities (user_id, google_sub, google_email) VALUES ((SELECT id FROM users WHERE display_id = ?), ?, ?)')
+        .bind(displayId, google.sub, google.email)
+    ]);
+  } catch (e) {
+    const again = await env.users_db
+      .prepare('SELECT user_id FROM google_identities WHERE google_sub = ?')
+      .bind(google.sub)
+      .first();
+    if (again) return fail('google_account_exists', 409, MSG.googleAccountExists);
+    console.error('google_signup_create_failed', e);
+    return fail('user_create_failed', 500, MSG.server);
+  }
+
+  const user = await env.users_db
+    .prepare('SELECT id, display_id FROM users WHERE display_id = ?')
+    .bind(displayId)
+    .first();
+  if (!user) return fail('user_create_failed', 500, MSG.server);
+
+  const token = await createSession(env, user.id, request);
+  const recoveryCode = await issueRecoveryCode(env, user.id);
+
+  return json({
+    success: true,
+    token,
+    user: { id: user.id, displayId: user.display_id },
+    recoveryCode,
+    googleLinked: true,
+  });
+}
+
+async function googleLogin(request, env) {
+  const body = await readJson(request);
+  const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
+  if (google.error) {
+    return fail(
+      google.error,
+      google.error === 'google_not_configured' ? 503 : 401,
+      google.error === 'google_not_configured' ? MSG.googleNotConfigured : MSG.googleInvalid
+    );
+  }
+
+  await ensureGoogleIdentityTables(env);
+
+  const rate = await takeRateLimit(env, 'google-login:' + google.sub, 20, 10 * 60 * 1000);
+  if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
+
+  const row = await env.users_db
+    .prepare('SELECT user_id FROM google_identities WHERE google_sub = ?')
+    .bind(google.sub)
+    .first();
+  if (!row) return fail('google_account_not_linked', 404, MSG.googleAccountNotLinked);
+
+  const user = await env.users_db
+    .prepare('SELECT id, display_id, status FROM users WHERE id = ?')
+    .bind(row.user_id)
+    .first();
+  if (!user) return fail('user_not_found', 404, MSG.noUser);
+  if (user.status !== 'active') return fail('account_disabled', 403, MSG.disabled);
+
+  await env.users_db
+    .prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?')
+    .bind(user.id)
+    .run();
+
+  const token = await createSession(env, user.id, request);
+  return json({ success: true, token, user: { id: user.id, displayId: user.display_id }, googleLinked: true });
+}
 
 // ==================================================
 // 5) REGISTER
