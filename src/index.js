@@ -53,6 +53,7 @@ const MSG = {
   googleNotConfigured: 'ورود با Google هنوز در سرور تنظیم نشده است.',
   googleInvalid: 'حساب Google قابل تأیید نبود. دوباره انتخابش کن.',
   googleAccountExists: 'این حساب Google قبلاً یک حساب Poppy دارد. با همان حساب وارد شو و دستگاه جدید را اضافه کن.',
+  googleAlreadyLinked: 'این حساب Poppy از قبل به یک Google Account وصل است.',
   rateLimited: 'تعداد تلاش‌ها زیاد است. چند دقیقه بعد دوباره امتحان کن.',
   notFound: 'آدرس پیدا نشد.',
 };
@@ -523,6 +524,7 @@ export default {
         if (!clientId) return fail('google_not_configured', 503, MSG.googleNotConfigured);
         return json({ success: true, clientId });
       }
+      if (path === '/api/auth/google/link' && method === 'POST') return await linkGoogle(request, env);
       if (path === '/api/auth/register/begin' && method === 'POST') {
         ctx.waitUntil(cleanup(env).catch(() => {}));
         return await registerBegin(request, env);
@@ -772,6 +774,22 @@ async function loginFinish(request, env) {
   return json({ success: true, token, user: { id: user.id, displayId: user.display_id } });
 }
 
+async function linkGoogle(request, env) {
+  const session = await getSessionUser(request, env);
+  if (session.error) return session.error;
+  const body = await readJson(request);
+  const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
+  if (google.error) return fail(google.error, google.error === 'google_not_configured' ? 503 : 401, google.error === 'google_not_configured' ? MSG.googleNotConfigured : MSG.googleInvalid);
+  await ensureGoogleIdentityTables(env);
+  const existingForUser = await env.users_db.prepare('SELECT google_sub FROM google_identities WHERE user_id = ?').bind(session.user.id).first();
+  if (existingForUser && existingForUser.google_sub === google.sub) return json({ success: true, linked: true, alreadyLinked: true });
+  if (existingForUser) return fail('google_already_linked', 409, MSG.googleAlreadyLinked);
+  const existing = await env.users_db.prepare('SELECT user_id FROM google_identities WHERE google_sub = ?').bind(google.sub).first();
+  if (existing && String(existing.user_id) !== String(session.user.id)) return fail('google_account_exists', 409, MSG.googleAccountExists);
+  await env.users_db.prepare('INSERT INTO google_identities (user_id, google_sub, google_email) VALUES (?, ?, ?)').bind(session.user.id, google.sub, google.email).run();
+  return json({ success: true, linked: true, email: google.email });
+}
+
 // ==================================================
 // 7) SESSION (me / logout)
 // ==================================================
@@ -783,6 +801,15 @@ async function me(request, env) {
     .prepare('SELECT COUNT(*) AS n FROM credentials WHERE user_id = ?')
     .bind(s.user.id)
     .first();
+
+  let googleLinked = false;
+  try {
+    await ensureGoogleIdentityTables(env);
+    const g = await env.users_db.prepare('SELECT user_id FROM google_identities WHERE user_id = ?').bind(s.user.id).first();
+    googleLinked = !!g;
+  } catch (e) {
+    googleLinked = false;
+  }
 
   let hasRecovery = false;
   try {
@@ -803,6 +830,7 @@ async function me(request, env) {
       status: s.user.status,
       credentialCount: (c && c.n) || 0,
       hasRecovery,
+      googleLinked,
     },
   });
 }
