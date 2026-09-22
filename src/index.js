@@ -475,7 +475,7 @@ function parseUserId(path) {
 }
 
 function parseAdminAccountId(path) {
-  const m = path.match(/^\/api\/admin\/administrators\/(\\d+)/);
+  const m = path.match(/^\/api\/admin\/administrators\/(\d+)/);
   return m ? Number.parseInt(m[1], 10) : null;
 }
 
