@@ -578,7 +578,7 @@ export default {
 };
 
 // ==================================================
-/* Google primary authentication: no mandatory WebAuthn */
+/* Google primary authentication */
 async function googleSignup(request, env) {
   const body = await readJson(request);
   const passwordError = validatePasswordInput(body && body.password, body && body.passwordConfirm);
