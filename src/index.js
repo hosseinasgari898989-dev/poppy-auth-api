@@ -12,6 +12,7 @@ const SESSION_TTL = '+30 days';
 const USER_SETTING_KEY_MAX = 64;
 const USER_SETTING_VALUE_MAX = 4096;
 const USER_SETTING_COUNT_MAX = 64;
+const USER_SETTINGS_TABLE = 'user_settings_v2';
 const GOOGLE_CLIENT_ID = '246560188376-prs0mf954qddb937v04s7krimjul9845.apps.googleusercontent.com';
 
 const CORS = {
@@ -66,7 +67,7 @@ function fail(code, status = 400, message = '', extra = {}) {
 
 async function ensureUserSettingsTable(env) {
   await env.users_db.prepare(`
-    CREATE TABLE IF NOT EXISTS user_settings (
+    CREATE TABLE IF NOT EXISTS ${USER_SETTINGS_TABLE} (
       user_id INTEGER NOT NULL,
       setting_key TEXT NOT NULL,
       setting_value TEXT NOT NULL,
@@ -80,7 +81,7 @@ async function getUserSettings(request, env) {
   const s = await getSessionUser(request, env);
   if (s.error) return s.error;
   await ensureUserSettingsTable(env);
-  const rows = await env.users_db.prepare('SELECT setting_key, setting_value FROM user_settings WHERE user_id = ?').bind(s.user.id).all();
+  const rows = await env.users_db.prepare('SELECT setting_key, setting_value FROM ${USER_SETTINGS_TABLE} WHERE user_id = ?').bind(s.user.id).all();
   const settings = {};
   for (const row of (rows.results || [])) settings[row.setting_key] = row.setting_value;
   return json({ success: true, settings });
@@ -101,16 +102,16 @@ async function saveUserSetting(request, env) {
   if (value.length > USER_SETTING_VALUE_MAX) return fail('setting_value_too_large', 413, MSG.settingValueTooLarge);
 
   await ensureUserSettingsTable(env);
-  const exists = await env.users_db.prepare('SELECT 1 FROM user_settings WHERE user_id = ? AND setting_key = ?').bind(s.user.id, key).first();
+  const exists = await env.users_db.prepare('SELECT 1 FROM ${USER_SETTINGS_TABLE} WHERE user_id = ? AND setting_key = ?').bind(s.user.id, key).first();
   if (!exists) {
-    const count = await env.users_db.prepare('SELECT COUNT(*) AS n FROM user_settings WHERE user_id = ?').bind(s.user.id).first();
+    const count = await env.users_db.prepare('SELECT COUNT(*) AS n FROM ${USER_SETTINGS_TABLE} WHERE user_id = ?').bind(s.user.id).first();
     if (Number((count && count.n) || 0) >= USER_SETTING_COUNT_MAX) return fail('setting_limit_reached', 409, MSG.settingLimitReached);
   }
 
   await env.users_db.prepare(`
-    INSERT INTO user_settings (user_id, setting_key, setting_value)
+    INSERT INTO ${USER_SETTINGS_TABLE} (user_id, setting_key, setting_value)
     VALUES (?, ?, ?)
-    ON CONFLICT(user_id, setting_key) DO UPDATE SET
+    ON CON CONFLICT(user_id, setting_key) DO UPDATE SET
       setting_value = excluded.setting_value,
       updated_at = CURRENT_TIMESTAMP
   `).bind(s.user.id, key, value).run();
@@ -399,6 +400,31 @@ const ADMIN_ROLE_LEVELS = {
   owner: 100
 };
 
+function getAdminPermissions(roleLevel, owner) {
+  const level = Number(roleLevel || 0);
+  const isOwner = !!owner || level >= ADMIN_ROLE_LEVELS.owner;
+  return {
+    view: level >= ADMIN_ROLE_LEVELS.viewer,
+    manageComments: level >= ADMIN_ROLE_LEVELS.moderator,
+    manageReports: level >= ADMIN_ROLE_LEVELS.moderator,
+    manageBans: level >= ADMIN_ROLE_LEVELS.moderator,
+    manageAI: isOwner || level >= ADMIN_ROLE_LEVELS.moderator,
+    manageUsers: isOwner || level >= ADMIN_ROLE_LEVELS.admin,
+    manageSiteSettings: isOwner || level >= ADMIN_ROLE_LEVELS.admin,
+    manageAdministrators: isOwner
+  };
+}
+
+function adminPayload(admin) {
+  return {
+    id: admin.id,
+    label: admin.label,
+    roleLevel: admin.roleLevel,
+    owner: !!admin.owner,
+    permissions: getAdminPermissions(admin.roleLevel, admin.owner)
+  };
+}
+
 async function ensureAdminTables(env) {
   await env.users_db.batch([
     env.users_db.prepare(`
@@ -565,12 +591,7 @@ async function adminLogin(request, env) {
   await recordAdminLogin(env, admin.id, request);
   return json({
     success: true,
-    admin: {
-      id: admin.id,
-      label: admin.label,
-      roleLevel: admin.roleLevel,
-      owner: admin.owner
-    }
+    admin: adminPayload(admin)
   });
 }
 
@@ -580,12 +601,7 @@ async function adminValidate(request, env) {
 
   return json({
     success: true,
-    admin: {
-      id: admin.id,
-      label: admin.label,
-      roleLevel: admin.roleLevel,
-      owner: admin.owner
-    }
+    admin: adminPayload(admin)
   });
 }
 
@@ -621,10 +637,7 @@ async function adminOwnerLogin(request, env) {
     success: true,
     token: sessionToken,
     admin: {
-      id: master.id,
-      label: master.label,
-      roleLevel: 100,
-      owner: true,
+      ...adminPayload({ id: master.id, label: master.label, roleLevel: 100, owner: true }),
       expiresIn: OWNER_SESSION_TTL
     }
   });
@@ -772,7 +785,7 @@ async function adminDeleteAdministrator(request, env, adminId) {
        (SELECT google_email FROM google_identities g WHERE g.user_id = u.id LIMIT 1) AS google_email,
        (SELECT last_viewed_at FROM recovery_code_views v WHERE v.user_id = u.id LIMIT 1) AS recovery_last_viewed_at,
        (SELECT created_at FROM recovery_codes r WHERE r.user_id = u.id LIMIT 1) AS recovery_created_at,
-       (SELECT COUNT(*) FROM user_settings us WHERE us.user_id = u.id) AS setting_count
+       (SELECT COUNT(*) FROM ${USER_SETTINGS_TABLE} us WHERE us.user_id = u.id) AS setting_count
      FROM users u
    `;
    const binds = [];
@@ -821,7 +834,7 @@ async function adminDeleteAdministrator(request, env, adminId) {
      env.users_db.prepare('SELECT created_at, updated_at FROM account_passwords WHERE user_id = ? LIMIT 1').bind(userId).first(),
      env.users_db.prepare('SELECT created_at FROM recovery_codes WHERE user_id = ? LIMIT 1').bind(userId).first(),
      env.users_db.prepare('SELECT last_viewed_at FROM recovery_code_views WHERE user_id = ? LIMIT 1').bind(userId).first(),
-     env.users_db.prepare('SELECT setting_key, setting_value, updated_at FROM user_settings WHERE user_id = ? ORDER BY setting_key ASC').bind(userId).all(),
+     env.users_db.prepare('SELECT setting_key, setting_value, updated_at FROM ${USER_SETTINGS_TABLE} WHERE user_id = ? ORDER BY setting_key ASC').bind(userId).all(),
    ]);
 
    const settings = {};
