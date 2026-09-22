@@ -1,26 +1,17 @@
 // ==================================================
 // Poppy Auth API  |  src/index.js
 // Cloudflare Workers + D1 (binding: users_db)
-// @simplewebauthn/server  (works with v10 AND v11+)
-// Features: passkey login, stored-credential hints,
-// recovery codes, add-new-device
+// Features: Google authentication, password-protected recovery codes,
+// sessions, and account settings
 // ==================================================
-
-import {
-  generateRegistrationOptions,
-  verifyRegistrationResponse,
-  generateAuthenticationOptions,
-  verifyAuthenticationResponse,
-} from '@simplewebauthn/server';
 
 // ==================================================
 // 1) CONFIG
 // ==================================================
-const RP_NAME = 'Poppy Playtime Archive';
-const WEBAUTHN_TIMEOUT = 120000;
-const CHALLENGE_TTL = '+10 minutes';
 const SESSION_TTL = '+30 days';
-const MAX_CREDENTIAL_HINTS = 20;
+const USER_SETTING_KEY_MAX = 64;
+const USER_SETTING_VALUE_MAX = 4096;
+const USER_SETTING_COUNT_MAX = 64;
 const GOOGLE_CLIENT_ID = '246560188376-prs0mf954qddb937v04s7krimjul9845.apps.googleusercontent.com';
 
 // Only these origins may register / login (no trailing slash).
@@ -39,13 +30,6 @@ const CORS = {
 const MSG = {
   generic: 'مشکلی پیش آمد. دوباره تلاش کن.',
   server: 'مشکلی در سرور پیش آمد. کمی بعد دوباره تلاش کن.',
-  origin: 'این سایت اجازه‌ی استفاده از ورود با اثر انگشت را ندارد.',
-  fields: 'اطلاعات ارسالی ناقص است. صفحه را دوباره باز کن و امتحان کن.',
-  challenge: 'زمان تأیید تمام شد. دوباره تلاش کن.',
-  verify: 'تأیید اثر انگشت انجام نشد. دوباره تلاش کن.',
-  dup: 'این اثر انگشت قبلاً ثبت شده است.',
-  credNotFound:
-    'این اثر انگشت در سایت ثبت نشده است. اگر قبلاً ثبت‌نام کرده‌ای با کد بازیابی وارد شو، وگرنه ثبت‌نام جدید بزن.',
   noUser: 'حساب پیدا نشد.',
   disabled: 'این حساب غیرفعال شده است.',
   notLoggedIn: 'وارد نشده‌ای یا مدت نشست تمام شده. دوباره وارد شو.',
@@ -58,7 +42,10 @@ const MSG = {
   passwordInvalid: 'رمز حساب درست نیست.',
   passwordNotSet: 'برای این حساب هنوز رمز عبور تنظیم نشده است.',
   recoveryCodeUnavailable: 'کد بازیابی قابل نمایش نیست. ابتدا امنیت حساب را کامل کن.',
-  registrationClosed: 'ثبت‌نام حساب جدید بسته است. با حساب موجود وارد شو و از گزینه افزودن دستگاه استفاده کن.',
+  recoveryViewCooldown: 'کد بازیابی اخیراً نمایش داده شده است. برای نمایش دوباره باید یک روز کامل صبر کنی.',
+  settingKeyInvalid: 'نام تنظیم حساب معتبر نیست.',
+  settingValueTooLarge: 'مقدار تنظیم حساب بیش از حد بزرگ است.',
+  settingLimitReached: 'تعداد تنظیمات ذخیره‌شده برای این حساب به حد مجاز رسیده است.',
   googleNotConfigured: 'ورود با Google هنوز در سرور تنظیم نشده است.',
   googleInvalid: 'حساب Google قابل تأیید نبود. دوباره انتخابش کن.',
   googleAccountExists: 'این Google Account قبلاً به یک حساب Playtime Channel متصل شده است. برای ورود از همان حساب Google استفاده کن.',
@@ -83,15 +70,8 @@ function fail(code, status = 400, message = '', extra = {}) {
   return json({ success: false, error: code, message: message || MSG.generic, ...extra }, status);
 }
 
-function getOrigin(request) {
-  const origin = request.headers.get('Origin');
-  if (!origin || origin === 'null') return null;
-  return ALLOWED_ORIGINS.includes(origin) ? origin : null;
-}
-
 async function ensureGoogleIdentityTables(env) {
   await env.users_db.prepare('CREATE TABLE IF NOT EXISTS google_identities (user_id INTEGER PRIMARY KEY, google_sub TEXT NOT NULL UNIQUE, google_email TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)').run();
-  await env.users_db.prepare('CREATE TABLE IF NOT EXISTS google_registration_challenges (challenge_id TEXT PRIMARY KEY, google_sub TEXT NOT NULL, google_email TEXT, google_name TEXT, expires_at TEXT NOT NULL)').run();
 }
 
 async function verifyGoogleIdToken(idToken, env) {
@@ -276,6 +256,10 @@ async function ensureAccountSecurityTables(env) {
       user_id INTEGER PRIMARY KEY,
       code_hash TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`),
+    env.users_db.prepare(`CREATE TABLE IF NOT EXISTS recovery_code_views (
+      user_id INTEGER PRIMARY KEY,
+      last_viewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )`)
   ]);
 }
