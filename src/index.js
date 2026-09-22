@@ -248,6 +248,7 @@ async function cleanup(env) {
   await env.users_db.batch([
     env.users_db.prepare("DELETE FROM challenges WHERE expires_at < datetime('now')"),
     env.users_db.prepare("DELETE FROM sessions WHERE expires_at < datetime('now')"),
+    env.users_db.prepare("DELETE FROM google_registration_challenges WHERE expires_at < datetime('now')"),
   ]);
 }
 
