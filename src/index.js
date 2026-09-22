@@ -320,12 +320,12 @@ async function issueRecoveryCode(env, userId) {
   try {
     const code = generateRecoveryCode();
     const hash = await sha256Hex(normalizeRecoveryCode(code));
-    await env.users_db
-      .prepare(
+    await env.users_db.batch([
+      env.users_db.prepare(
         'INSERT INTO recovery_codes (user_id, code_hash) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET code_hash = excluded.code_hash, created_at = CURRENT_TIMESTAMP'
-      )
-      .bind(userId, hash)
-      .run();
+      ).bind(userId, hash),
+      env.users_db.prepare('DELETE FROM recovery_code_views WHERE user_id = ?').bind(userId)
+    ]);
     return code;
   } catch (e) {
     console.error('recovery_issue_failed', e);
@@ -746,14 +746,36 @@ async function passwordSetup(request, env) {
 async function recoveryView(request, env) {
   const s = await getSessionUser(request, env);
   if (s.error) return s.error;
+
   const rate = await takeRateLimit(env, 'recovery-view:' + s.user.id, 8, 15 * 60 * 1000);
   if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
 
   const body = await readJson(request);
   const password = body && typeof body.password === 'string' ? body.password : '';
-  if (!password) return fail('password_required', 400, MSG.passwordRequired);
+  const passwordConfirm = body && typeof body.passwordConfirm === 'string' ? body.passwordConfirm : '';
+  if (!password || !passwordConfirm) return fail('password_required', 400, MSG.passwordRequired);
+  if (password !== passwordConfirm) return fail('password_mismatch', 400, MSG.passwordMismatch);
 
   await ensureAccountSecurityTables(env);
+
+  async function cooldownInfo() {
+    return await env.users_db.prepare(`
+      SELECT
+        datetime(last_viewed_at, '+1 day') AS next_allowed_at,
+        MAX(1, CAST(strftime('%s', datetime(last_viewed_at, '+1 day')) - strftime('%s', 'now') AS INTEGER)) AS retry_after
+      FROM recovery_code_views
+      WHERE user_id = ?
+    `).bind(s.user.id).first();
+  }
+
+  const cooldown = await cooldownInfo();
+  if (cooldown && Number(cooldown.retry_after || 0) > 0) {
+    return fail('recovery_view_cooldown', 429, MSG.recoveryViewCooldown, {
+      retryAfter: Number(cooldown.retry_after),
+      nextAllowedAt: cooldown.next_allowed_at
+    });
+  }
+
   const pw = await env.users_db.prepare('SELECT salt, password_hash, iterations FROM account_passwords WHERE user_id = ?').bind(s.user.id).first();
   if (!pw) return fail('password_not_set', 409, MSG.passwordNotSet);
 
@@ -774,9 +796,25 @@ async function recoveryView(request, env) {
   const hash = await sha256Hex(normalizeRecoveryCode(recoveryCode));
   const stored = await env.users_db.prepare('SELECT code_hash FROM recovery_codes WHERE user_id = ?').bind(s.user.id).first();
   if (!stored || stored.code_hash !== hash) return fail('recovery_code_unavailable', 409, MSG.recoveryCodeUnavailable);
+
+  const claim = await env.users_db.prepare(`
+    INSERT INTO recovery_code_views (user_id, last_viewed_at)
+    VALUES (?, CURRENT_TIMESTAMP)
+    ON CONFLICT(user_id) DO UPDATE SET
+      last_viewed_at = excluded.last_viewed_at
+    WHERE recovery_code_views.last_viewed_at <= datetime('now', '-1 day')
+  `).bind(s.user.id).run();
+
+  if (Number((claim.meta && claim.meta.changes) || 0) !== 1) {
+    const retry = await cooldownInfo();
+    return fail('recovery_view_cooldown', 429, MSG.recoveryViewCooldown, {
+      retryAfter: Number((retry && retry.retry_after) || 86400),
+      nextAllowedAt: retry && retry.next_allowed_at
+    });
+  }
+
   return json({ success: true, recoveryCode, permanent: true });
 }
-
 
 async function recoveryLogin(request, env) {
   const rate = await guardRateLimit(request, env, 'recovery-login', 5, 15 * 60 * 1000);
