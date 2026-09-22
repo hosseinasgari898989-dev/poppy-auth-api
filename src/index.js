@@ -271,6 +271,11 @@ async function ensureAccountSecurityTables(env) {
       ciphertext TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`),
+    env.users_db.prepare(`CREATE TABLE IF NOT EXISTS recovery_codes (
+      user_id INTEGER PRIMARY KEY,
+      code_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )`)
   ]);
 }
@@ -722,7 +727,7 @@ async function googleSignup(request, env) {
     const again = await env.users_db.prepare('SELECT user_id FROM google_identities WHERE google_sub = ?').bind(google.sub).first();
     if (again) return fail('google_account_exists', 409, MSG.googleAccountExists);
     console.error('google_signup_create_failed', e);
-    return fail('user_create_failed', 500, MSG.server);
+    return fail('user_create_failed', 500, MSG.server, { detail: String((e && e.message) || e) });
   }
 
   const user = await env.users_db.prepare('SELECT id, display_id FROM users WHERE display_id = ?').bind(displayId).first();
