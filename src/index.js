@@ -411,6 +411,10 @@ async function issueRecoveryCode(env, userId) {
    const limit = Math.min(Math.max(Number.isFinite(limitParam) ? limitParam : 200, 1), 500);
    const search = (url.searchParams.get('search') || '').trim();
 
+   await ensureGoogleIdentityTables(env);
+   await ensureAccountSecurityTables(env);
+   await ensureUserSettingsTable(env);
+
    let query = `
      SELECT
        u.id,
@@ -419,14 +423,21 @@ async function issueRecoveryCode(env, userId) {
        u.trust_level,
        u.last_login,
        u.created_at,
-         (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > datetime('now')) AS active_session_count,
-       EXISTS(SELECT 1 FROM recovery_codes r WHERE r.user_id = u.id) AS has_recovery
+       (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > datetime('now')) AS active_session_count,
+       EXISTS(SELECT 1 FROM recovery_codes r WHERE r.user_id = u.id) AS has_recovery,
+       EXISTS(SELECT 1 FROM account_passwords p WHERE p.user_id = u.id) AS has_password,
+       EXISTS(SELECT 1 FROM google_identities g WHERE g.user_id = u.id) AS google_linked,
+       (SELECT google_email FROM google_identities g WHERE g.user_id = u.id LIMIT 1) AS google_email,
+       (SELECT last_viewed_at FROM recovery_code_views v WHERE v.user_id = u.id LIMIT 1) AS recovery_last_viewed_at,
+       (SELECT created_at FROM recovery_codes r WHERE r.user_id = u.id LIMIT 1) AS recovery_created_at,
+       (SELECT COUNT(*) FROM user_settings us WHERE us.user_id = u.id) AS setting_count
      FROM users u
    `;
    const binds = [];
    if (search) {
-     query += ' WHERE u.display_id LIKE ? OR CAST(u.id AS TEXT) LIKE ?';
-     binds.push('%' + search + '%', '%' + search + '%');
+     query += ' WHERE u.display_id LIKE ? OR CAST(u.id AS TEXT) LIKE ? OR EXISTS(SELECT 1 FROM google_identities sg WHERE sg.user_id = u.id AND sg.google_email LIKE ?)';
+     const q = '%' + search + '%';
+     binds.push(q, q, q);
    }
    query += ' ORDER BY u.id ASC LIMIT ?';
    binds.push(limit);
@@ -441,17 +452,42 @@ async function issueRecoveryCode(env, userId) {
      createdAt: r.created_at || null,
      activeSessionCount: Number(r.active_session_count || 0),
      hasRecovery: !!r.has_recovery,
+     passwordSet: !!r.has_password,
+     googleLinked: !!r.google_linked,
+     googleEmail: r.google_email || null,
+     recoveryLastViewedAt: r.recovery_last_viewed_at || null,
+     recoveryCreatedAt: r.recovery_created_at || null,
+     settingsCount: Number(r.setting_count || 0),
    }));
    return json({ success: true, users });
  }
 
  async function adminUserDetail(request, env, userId) {
+   await ensureGoogleIdentityTables(env);
+   await ensureAccountSecurityTables(env);
+   await ensureUserSettingsTable(env);
+
    const user = await env.users_db
      .prepare('SELECT id, display_id, status, trust_level, last_login, created_at FROM users WHERE id = ?')
      .bind(userId)
      .first();
    if (!user) return fail('user_not_found', 404, MSG.noUser);
 
+   const [sessions, google, password, recovery, recoveryView, settingsRows] = await Promise.all([
+     env.users_db.prepare("SELECT expires_at, user_agent FROM sessions WHERE user_id = ? AND expires_at > datetime('now') ORDER BY expires_at ASC").bind(userId).all(),
+     env.users_db.prepare('SELECT google_email FROM google_identities WHERE user_id = ? LIMIT 1').bind(userId).first(),
+     env.users_db.prepare('SELECT created_at, updated_at FROM account_passwords WHERE user_id = ? LIMIT 1').bind(userId).first(),
+     env.users_db.prepare('SELECT created_at FROM recovery_codes WHERE user_id = ? LIMIT 1').bind(userId).first(),
+     env.users_db.prepare('SELECT last_viewed_at FROM recovery_code_views WHERE user_id = ? LIMIT 1').bind(userId).first(),
+     env.users_db.prepare('SELECT setting_key, setting_value, updated_at FROM user_settings WHERE user_id = ? ORDER BY setting_key ASC').bind(userId).all(),
+   ]);
+
+   const settings = {};
+   for (const row of (settingsRows.results || [])) {
+     settings[row.setting_key] = { value: row.setting_value, updatedAt: row.updated_at || null };
+   }
+
+   const activeSessions = sessions.results || [];
    return json({
      success: true,
      user: {
@@ -461,11 +497,20 @@ async function issueRecoveryCode(env, userId) {
        trustLevel: user.trust_level,
        lastLogin: user.last_login || null,
        createdAt: user.created_at || null,
-       activeSessionCount: (sessions.results || []).length,
-       sessions: (sessions.results || []).map((r) => ({
+       googleLinked: !!google,
+       googleEmail: google?.google_email || null,
+       passwordSet: !!password,
+       passwordUpdatedAt: password?.updated_at || password?.created_at || null,
+       hasRecovery: !!recovery,
+       recoveryCreatedAt: recovery?.created_at || null,
+       recoveryLastViewedAt: recoveryView?.last_viewed_at || null,
+       activeSessionCount: activeSessions.length,
+       sessions: activeSessions.map((r) => ({
          expiresAt: r.expires_at || null,
          userAgent: r.user_agent || '',
        })),
+       settings,
+       settingCount: Object.keys(settings).length,
      },
    });
  }
