@@ -81,7 +81,7 @@ async function getUserSettings(request, env) {
   const s = await getSessionUser(request, env);
   if (s.error) return s.error;
   await ensureUserSettingsTable(env);
-  const rows = await env.users_db.prepare('SELECT setting_key, setting_value FROM ${USER_SETTINGS_TABLE} WHERE user_id = ?').bind(s.user.id).all();
+  const rows = await env.users_db.prepare(`SELECT setting_key, setting_value FROM ${USER_SETTINGS_TABLE} WHERE user_id = ?`).bind(s.user.id).all();
   const settings = {};
   for (const row of (rows.results || [])) settings[row.setting_key] = row.setting_value;
   return json({ success: true, settings });
@@ -102,9 +102,9 @@ async function saveUserSetting(request, env) {
   if (value.length > USER_SETTING_VALUE_MAX) return fail('setting_value_too_large', 413, MSG.settingValueTooLarge);
 
   await ensureUserSettingsTable(env);
-  const exists = await env.users_db.prepare('SELECT 1 FROM ${USER_SETTINGS_TABLE} WHERE user_id = ? AND setting_key = ?').bind(s.user.id, key).first();
+  const exists = await env.users_db.prepare(`SELECT 1 FROM ${USER_SETTINGS_TABLE} WHERE user_id = ? AND setting_key = ?`).bind(s.user.id, key).first();
   if (!exists) {
-    const count = await env.users_db.prepare('SELECT COUNT(*) AS n FROM ${USER_SETTINGS_TABLE} WHERE user_id = ?').bind(s.user.id).first();
+    const count = await env.users_db.prepare(`SELECT COUNT(*) AS n FROM ${USER_SETTINGS_TABLE} WHERE user_id = ?`).bind(s.user.id).first();
     if (Number((count && count.n) || 0) >= USER_SETTING_COUNT_MAX) return fail('setting_limit_reached', 409, MSG.settingLimitReached);
   }
 
@@ -834,7 +834,7 @@ async function adminDeleteAdministrator(request, env, adminId) {
      env.users_db.prepare('SELECT created_at, updated_at FROM account_passwords WHERE user_id = ? LIMIT 1').bind(userId).first(),
      env.users_db.prepare('SELECT created_at FROM recovery_codes WHERE user_id = ? LIMIT 1').bind(userId).first(),
      env.users_db.prepare('SELECT last_viewed_at FROM recovery_code_views WHERE user_id = ? LIMIT 1').bind(userId).first(),
-     env.users_db.prepare('SELECT setting_key, setting_value, updated_at FROM ${USER_SETTINGS_TABLE} WHERE user_id = ? ORDER BY setting_key ASC').bind(userId).all(),
+     env.users_db.prepare(`SELECT setting_key, setting_value, updated_at FROM ${USER_SETTINGS_TABLE} WHERE user_id = ? ORDER BY setting_key ASC`).bind(userId).all(),
    ]);
 
    const settings = {};
