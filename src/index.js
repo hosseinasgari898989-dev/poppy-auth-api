@@ -56,7 +56,14 @@ const MSG = {
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { ...CORS, 'Content-Type': 'application/json' },
+    headers: {
+      ...CORS,
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+      'Pragma': 'no-cache',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer'
+    },
   });
 }
 
@@ -111,7 +118,7 @@ async function saveUserSetting(request, env) {
   await env.users_db.prepare(`
     INSERT INTO ${USER_SETTINGS_TABLE} (user_id, setting_key, setting_value)
     VALUES (?, ?, ?)
-    ON CON CONFLICT(user_id, setting_key) DO UPDATE SET
+    ON CONFLICT(user_id, setting_key) DO UPDATE SET
       setting_value = excluded.setting_value,
       updated_at = CURRENT_TIMESTAMP
   `).bind(s.user.id, key, value).run();
@@ -205,28 +212,32 @@ function clientKey(request, scope) {
 async function takeRateLimit(env, key, limit, windowMs) {
   await ensureRateLimitTable(env);
   const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
-  const row = await env.users_db
-    .prepare('SELECT window_start, count FROM auth_rate_limits WHERE key = ?')
-    .bind(key)
-    .first();
 
-  if (!row || Number(row.window_start) !== windowStart) {
-    await env.users_db.prepare(
-      `INSERT INTO auth_rate_limits (key, window_start, count) VALUES (?, ?, 1)
-       ON CONFLICT(key) DO UPDATE SET window_start = excluded.window_start, count = 1`
-    ).bind(key, windowStart).run();
-    return { allowed: true, retryAfter: Math.ceil((windowStart + windowMs - Date.now()) / 1000) };
-  }
+  // Atomic reservation: one SQL write performs the limit check + increment.
+  // This prevents concurrent requests from all passing the same stale count.
+  const result = await env.users_db.prepare(
+    `INSERT INTO auth_rate_limits (key, window_start, count)
+     VALUES (?, ?, 1)
+     ON CONFLICT(key) DO UPDATE SET
+       window_start = CASE
+         WHEN auth_rate_limits.window_start <> excluded.window_start
+           THEN excluded.window_start
+         ELSE auth_rate_limits.window_start
+       END,
+       count = CASE
+         WHEN auth_rate_limits.window_start <> excluded.window_start
+           THEN 1
+         ELSE auth_rate_limits.count + 1
+       END
+     WHERE auth_rate_limits.window_start <> excluded.window_start
+        OR auth_rate_limits.count < ?`
+  ).bind(key, windowStart, limit).run();
 
-  if (Number(row.count) >= limit) {
-    return { allowed: false, retryAfter: Math.max(1, Math.ceil((windowStart + windowMs - Date.now()) / 1000)) };
-  }
-
-  await env.users_db
-    .prepare('UPDATE auth_rate_limits SET count = count + 1 WHERE key = ? AND window_start = ?')
-    .bind(key, windowStart).run();
-
-  return { allowed: true, retryAfter: Math.ceil((windowStart + windowMs - Date.now()) / 1000) };
+  const allowed = Number(result?.meta?.changes || 0) === 1;
+  return {
+    allowed,
+    retryAfter: Math.max(1, Math.ceil((windowStart + windowMs - Date.now()) / 1000))
+  };
 }
 
 async function guardRateLimit(request, env, scope, limit, windowMs) {
@@ -1006,7 +1017,7 @@ export default {
       return fail('not_found', 404, MSG.notFound);
     } catch (e) {
       console.error(e);
-      return fail('server_error', 500, MSG.server, { detail: String((e && e.message) || e) });
+      return fail('server_error', 500, MSG.server);
     }
   },
 };
@@ -1015,6 +1026,11 @@ export default {
 /* Google primary authentication */
 async function googleSignup(request, env) {
   const body = await readJson(request);
+
+  // Rate-limit by IP before calling Google's tokeninfo endpoint.
+  const ipRate = await guardRateLimit(request, env, 'google-signup-ip', 12, 10 * 60 * 1000);
+  if (ipRate) return ipRate;
+
   const passwordError = validatePasswordInput(body && body.password, body && body.passwordConfirm);
   if (passwordError) return fail(passwordError.error, 400, MSG[passwordError.error] || MSG.generic);
   const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
@@ -1061,7 +1077,7 @@ async function googleSignup(request, env) {
     const again = await env.users_db.prepare('SELECT user_id FROM google_identities WHERE google_sub = ?').bind(google.sub).first();
     if (again) return fail('google_account_exists', 409, MSG.googleAccountExists);
     console.error('google_signup_create_failed', e);
-    return fail('user_create_failed', 500, MSG.server, { detail: String((e && e.message) || e) });
+    return fail('user_create_failed', 500, MSG.server);
   }
 
   const user = await env.users_db.prepare('SELECT id, display_id FROM users WHERE display_id = ?').bind(displayId).first();
@@ -1105,6 +1121,11 @@ async function googleSignupCheck(request, env) {
 
 async function googleLogin(request, env) {
   const body = await readJson(request);
+
+  // Rate-limit by IP before calling Google's tokeninfo endpoint.
+  const ipRate = await guardRateLimit(request, env, 'google-login-ip', 20, 10 * 60 * 1000);
+  if (ipRate) return ipRate;
+
   const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
   if (google.error) {
     return fail(
