@@ -50,6 +50,9 @@ const MSG = {
   notLoggedIn: 'وارد نشده‌ای یا مدت نشست تمام شده. دوباره وارد شو.',
   badRecovery: 'کد بازیابی درست نیست. با دقت دوباره وارد کن.',
   registrationClosed: 'ثبت‌نام حساب جدید بسته است. با حساب موجود وارد شو و از گزینه افزودن دستگاه استفاده کن.',
+  googleNotConfigured: 'ورود با Google هنوز در سرور تنظیم نشده است.',
+  googleInvalid: 'حساب Google قابل تأیید نبود. دوباره انتخابش کن.',
+  googleAccountExists: 'این حساب Google قبلاً یک حساب Poppy دارد. با همان حساب وارد شو و دستگاه جدید را اضافه کن.',
   rateLimited: 'تعداد تلاش‌ها زیاد است. چند دقیقه بعد دوباره امتحان کن.',
   notFound: 'آدرس پیدا نشد.',
 };
@@ -73,6 +76,45 @@ function getOrigin(request) {
   const origin = request.headers.get('Origin');
   if (!origin || origin === 'null') return null;
   return ALLOWED_ORIGINS.includes(origin) ? origin : null;
+}
+
+async function ensureGoogleIdentityTables(env) {
+  await env.users_db.prepare('CREATE TABLE IF NOT EXISTS google_identities (user_id INTEGER PRIMARY KEY, google_sub TEXT NOT NULL UNIQUE, google_email TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)').run();
+  await env.users_db.prepare('CREATE TABLE IF NOT EXISTS google_registration_challenges (challenge_id TEXT PRIMARY KEY, google_sub TEXT NOT NULL, google_email TEXT, google_name TEXT, expires_at TEXT NOT NULL)').run();
+}
+
+async function verifyGoogleIdToken(idToken, env) {
+  const clientId = String(env.GOOGLE_CLIENT_ID || '').trim();
+  if (!clientId) return { error: 'google_not_configured' };
+  if (!idToken || typeof idToken !== 'string' || idToken.length < 100) return { error: 'invalid_google_credential' };
+  try {
+    const r = await fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken));
+    if (!r.ok) return { error: 'invalid_google_credential' };
+    const p = await r.json();
+    const iss = String(p.iss || '');
+    const aud = String(p.aud || '');
+    const sub = String(p.sub || '');
+    const email = String(p.email || '');
+    const verified = p.email_verified === true || String(p.email_verified).toLowerCase() === 'true';
+    const exp = Number(p.exp || 0);
+    if (!sub || !email || !verified || aud !== clientId || (iss !== 'https://accounts.google.com' && iss !== 'accounts.google.com') || !exp || exp <= Math.floor(Date.now() / 1000)) return { error: 'invalid_google_credential' };
+    return { ok: true, sub, email, name: String(p.name || '') };
+  } catch (e) {
+    console.error('google_token_verify_failed', e);
+    return { error: 'invalid_google_credential' };
+  }
+}
+
+async function saveGoogleRegistrationChallenge(env, data) {
+  await ensureGoogleIdentityTables(env);
+  await env.users_db.prepare("INSERT INTO google_registration_challenges (challenge_id, google_sub, google_email, google_name, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+10 minutes'))").bind(data.challengeId, data.googleSub, data.googleEmail, data.googleName || '').run();
+}
+
+async function takeGoogleRegistrationChallenge(env, challengeId) {
+  await ensureGoogleIdentityTables(env);
+  const row = await env.users_db.prepare("SELECT * FROM google_registration_challenges WHERE challenge_id = ? AND expires_at > datetime('now')").bind(challengeId).first();
+  if (row) await env.users_db.prepare('DELETE FROM google_registration_challenges WHERE challenge_id = ?').bind(challengeId).run();
+  return row;
 }
 
 function b64uEncode(input) {
@@ -476,6 +518,11 @@ export default {
       }
 
       // ----- existing endpoints -----
+      if (path === '/api/auth/google/config' && method === 'GET') {
+        const clientId = String(env.GOOGLE_CLIENT_ID || '').trim();
+        if (!clientId) return fail('google_not_configured', 503, MSG.googleNotConfigured);
+        return json({ success: true, clientId });
+      }
       if (path === '/api/auth/register/begin' && method === 'POST') {
         ctx.waitUntil(cleanup(env).catch(() => {}));
         return await registerBegin(request, env);
@@ -543,153 +590,79 @@ export default {
 // ==================================================
 // 5) REGISTER
 // ==================================================
-async function ensureRegistrationGate(env) {
-  await env.users_db.prepare(
-    `CREATE TABLE IF NOT EXISTS registration_gate (
-      id INTEGER PRIMARY KEY CHECK (id = 1)
-    )`
-  ).run();
-}
-
-async function claimInitialRegistration(env) {
-  await ensureRegistrationGate(env);
-  const result = await env.users_db.prepare(
-    'INSERT OR IGNORE INTO registration_gate (id) VALUES (1)'
-  ).run();
-  return !!(result.meta && Number(result.meta.changes || 0) === 1);
-}
 
 async function registerBegin(request, env) {
-  const rate = await guardRateLimit(request, env, 'register-begin', 3, 10 * 60 * 1000);
-  if (rate) return rate;
-
   const origin = getOrigin(request);
   if (!origin) return fail('origin_not_allowed', 403, MSG.origin);
-
+  const body = await readJson(request);
+  const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
+  if (google.error) return fail(google.error, google.error === 'google_not_configured' ? 503 : 401, google.error === 'google_not_configured' ? MSG.googleNotConfigured : MSG.googleInvalid);
+  await ensureGoogleIdentityTables(env);
+  const existing = await env.users_db.prepare('SELECT user_id FROM google_identities WHERE google_sub = ?').bind(google.sub).first();
+  if (existing) return fail('google_account_exists', 409, MSG.googleAccountExists);
+  const rate = await takeRateLimit(env, 'register-google-begin:' + google.sub, 4, 10 * 60 * 1000);
+  if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
   const rpId = new URL(origin).hostname;
-
-  // userID must be bytes (Uint8Array)
   const userHandle = crypto.getRandomValues(new Uint8Array(16));
   const userHandleB64 = b64uEncode(userHandle);
-
-  // no authenticatorAttachment: phones, computers (via phone QR) and security keys all allowed
   const options = await generateRegistrationOptions({
     rpName: RP_NAME,
     rpID: rpId,
     userID: userHandle,
     userName: 'poppy-' + userHandleB64.slice(0, 6),
-    userDisplayName: 'Poppy User',
+    userDisplayName: google.name || google.email,
     attestationType: 'none',
     timeout: WEBAUTHN_TIMEOUT,
-    authenticatorSelection: {
-      userVerification: 'required',
-      residentKey: 'preferred',
-    },
+    authenticatorSelection: { userVerification: 'required', residentKey: 'preferred' },
     supportedAlgorithmIDs: [-7, -257],
   });
-
   const challengeId = randomId(16);
-  await saveChallenge(env, {
-    id: challengeId,
-    userId: userHandleB64,
-    challenge: options.challenge,
-    type: 'register',
-    origin,
-    rpId,
-  });
-
+  await saveChallenge(env, { id: challengeId, userId: userHandleB64, challenge: options.challenge, type: 'register', origin, rpId });
+  await saveGoogleRegistrationChallenge(env, { challengeId, googleSub: google.sub, googleEmail: google.email, googleName: google.name });
   return json({ success: true, options, challengeId });
 }
 
 async function registerFinish(request, env) {
-  const rate = await guardRateLimit(request, env, 'register-finish', 6, 10 * 60 * 1000);
-  if (rate) return rate;
-
   const body = await readJson(request);
   const { challengeId, credential } = body || {};
   if (!challengeId || !credential) return fail('missing_fields', 400, MSG.fields);
-
   const ch = await takeChallenge(env, challengeId, 'register');
   if (!ch) return fail('challenge_not_found_or_expired', 400, MSG.challenge);
-
+  const googleCh = await takeGoogleRegistrationChallenge(env, challengeId);
+  if (!googleCh) return fail('invalid_google_credential', 401, MSG.googleInvalid);
+  const rate = await takeRateLimit(env, 'register-google-finish:' + googleCh.google_sub, 6, 10 * 60 * 1000);
+  if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
+  const existing = await env.users_db.prepare('SELECT user_id FROM google_identities WHERE google_sub = ?').bind(googleCh.google_sub).first();
+  if (existing) return fail('google_account_exists', 409, MSG.googleAccountExists);
   let verification;
   try {
-    verification = await verifyRegistrationResponse({
-      response: credential,
-      expectedChallenge: ch.challenge,
-      expectedOrigin: ch.origin,
-      expectedRPID: ch.rp_id,
-      requireUserVerification: true,
-    });
+    verification = await verifyRegistrationResponse({ response: credential, expectedChallenge: ch.challenge, expectedOrigin: ch.origin, expectedRPID: ch.rp_id, requireUserVerification: true });
   } catch (e) {
     return fail('verification_failed: ' + e.message, 400, MSG.verify, { detail: e.message });
   }
   if (!verification.verified) return fail('not_verified', 400, MSG.verify);
-
   const reg = extractRegistration(verification);
   if (!reg) return fail('bad_registration_info', 500, MSG.server);
-
-  const registrationDailyLimit = await guardRateLimit(request, env, 'register-success', 3, 24 * 60 * 60 * 1000);
-  if (registrationDailyLimit) return registrationDailyLimit;
-
-  const dup = await env.users_db
-    .prepare('SELECT credential_id FROM credentials WHERE credential_id = ?')
-    .bind(reg.credentialIdB64)
-    .first();
+  const dup = await env.users_db.prepare('SELECT credential_id FROM credentials WHERE credential_id = ?').bind(reg.credentialIdB64).first();
   if (dup) return fail('credential_already_registered', 409, MSG.dup);
-
   let displayId = null;
   for (let i = 0; i < 10; i++) {
     const id = generateDisplayId();
-    const exists = await env.users_db
-      .prepare('SELECT id FROM users WHERE display_id = ?')
-      .bind(id)
-      .first();
-    if (!exists) {
-      displayId = id;
-      break;
-    }
+    const exists = await env.users_db.prepare('SELECT id FROM users WHERE display_id = ?').bind(id).first();
+    if (!exists) { displayId = id; break; }
   }
   if (!displayId) return fail('id_generation_failed', 500, MSG.server);
-
   const userAgent = request.headers.get('User-Agent') || '';
-
-  // user + credential in one transaction
-  try {
-    await env.users_db.batch([
-      env.users_db
-        .prepare('INSERT INTO users (display_id, status, trust_level) VALUES (?, ?, ?)')
-        .bind(displayId, 'active', 'new'),
-      env.users_db
-        .prepare(
-          'INSERT INTO credentials (credential_id, user_id, public_key, counter, device_info) VALUES (?, (SELECT id FROM users WHERE display_id = ?), ?, ?, ?)'
-        )
-        .bind(reg.credentialIdB64, displayId, reg.publicKeyB64, reg.counter, userAgent),
-    ]);
-  } catch (e) {
-    try {
-      await env.users_db.prepare('DELETE FROM registration_gate WHERE id = 1').run();
-    } catch (cleanupError) {
-      console.error('registration_gate_cleanup_failed', cleanupError);
-    }
-    throw e;
-  }
-
-  const user = await env.users_db
-    .prepare('SELECT id, display_id FROM users WHERE display_id = ?')
-    .bind(displayId)
-    .first();
+  await env.users_db.batch([
+    env.users_db.prepare('INSERT INTO users (display_id, status, trust_level) VALUES (?, ?, ?)').bind(displayId, 'active', 'new'),
+    env.users_db.prepare('INSERT INTO credentials (credential_id, user_id, public_key, counter, device_info) VALUES (?, (SELECT id FROM users WHERE display_id = ?), ?, ?, ?)').bind(reg.credentialIdB64, displayId, reg.publicKeyB64, reg.counter, userAgent),
+    env.users_db.prepare('INSERT INTO google_identities (user_id, google_sub, google_email) VALUES ((SELECT id FROM users WHERE display_id = ?), ?, ?)').bind(displayId, googleCh.google_sub, googleCh.google_email)
+  ]);
+  const user = await env.users_db.prepare('SELECT id, display_id FROM users WHERE display_id = ?').bind(displayId).first();
   if (!user) return fail('user_create_failed', 500, MSG.server);
-
   const token = await createSession(env, user.id, request);
   const recoveryCode = await issueRecoveryCode(env, user.id);
-
-  return json({
-    success: true,
-    token,
-    user: { id: user.id, displayId: user.display_id },
-    recoveryCode, // shown to the user once (null if recovery table is missing)
-  });
+  return json({ success: true, token, user: { id: user.id, displayId: user.display_id }, recoveryCode });
 }
 
 // ==================================================
