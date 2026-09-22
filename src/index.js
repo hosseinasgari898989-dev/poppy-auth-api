@@ -388,22 +388,364 @@ async function issueRecoveryCode(env, userId) {
 }
 
 // ==================================================
- // 3.5) OWNER ADMIN HELPERS
- // ==================================================
- function isOwnerAdmin(request, env) {
-   const configured = env.AUTH_ADMIN_TOKEN || '';
-   const token = request.headers.get('X-Admin-Token') || '';
-   return !!configured && token === configured;
- }
+// 3.5) OWNER / ADMIN ACCESS HELPERS
+// ==================================================
+const OWNER_ADMIN_KEYWORD_HASH = '3cc6e58c29044816942c6527628b0a3da4f4197d929a64cb59e7b9cea020c2c4';
+const OWNER_SESSION_TTL = '+24 hours';
+const ADMIN_ROLE_LEVELS = {
+  viewer: 1,
+  moderator: 2,
+  admin: 3,
+  owner: 100
+};
 
- function adminUnauthorized() {
-   return fail('unauthorized', 401, 'دسترسی مدیریت نیاز به کلید معتبر دارد.');
- }
+async function ensureAdminTables(env) {
+  await env.users_db.batch([
+    env.users_db.prepare(`
+      CREATE TABLE IF NOT EXISTS admin_accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        label TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        role_level INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'active',
+        is_builtin INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_login_at TEXT,
+        login_count INTEGER NOT NULL DEFAULT 0
+      )
+    `),
+    env.users_db.prepare(`
+      CREATE TABLE IF NOT EXISTS admin_sessions (
+        token_hash TEXT PRIMARY KEY,
+        admin_account_id INTEGER NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.users_db.prepare(`
+      CREATE TABLE IF NOT EXISTS admin_login_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        admin_account_id INTEGER NOT NULL,
+        logged_in_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        ip TEXT,
+        user_agent TEXT
+      )
+    `)
+  ]);
 
- function parseUserId(path) {
-   const m = path.match(/^\/api\/admin\/users\/([^/]+)/);
-   return m ? decodeURIComponent(m[1]) : null;
- }
+  const masterToken = String(env.AUTH_ADMIN_TOKEN || '').trim();
+  if (masterToken) {
+    const hash = await sha256Hex(masterToken);
+    const existing = await env.users_db.prepare(
+      'SELECT id FROM admin_accounts WHERE is_builtin = 1 LIMIT 1'
+    ).first();
+
+    if (existing) {
+      await env.users_db.prepare(`
+        UPDATE admin_accounts
+        SET label = 'مالک اصلی',
+            token_hash = ?,
+            role_level = 100,
+            status = 'active',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).bind(hash, existing.id).run();
+    } else {
+      await env.users_db.prepare(`
+        INSERT INTO admin_accounts
+          (label, token_hash, role_level, status, is_builtin)
+        VALUES ('مالک اصلی', ?, 100, 'active', 1)
+      `).bind(hash).run();
+    }
+  }
+}
+
+function adminUnauthorized() {
+  return fail('unauthorized', 401, 'دسترسی مدیریت نیاز به کلید معتبر دارد.');
+}
+
+function adminForbidden() {
+  return fail('forbidden', 403, 'سطح دسترسی لازم برای این عملیات را نداری.');
+}
+
+function parseUserId(path) {
+  const m = path.match(/^\/api\/admin\/users\/([^/]+)/);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+function parseAdminAccountId(path) {
+  const m = path.match(/^\/api\/admin\/administrators\/(\\d+)/);
+  return m ? Number.parseInt(m[1], 10) : null;
+}
+
+async function getAdminIdentity(request, env) {
+  const token = request.headers.get('X-Admin-Token') || '';
+  if (!token) return null;
+
+  await ensureAdminTables(env);
+  const hash = await sha256Hex(token);
+
+  const session = await env.users_db.prepare(`
+    SELECT s.admin_account_id, a.label, a.role_level, a.status, a.is_builtin
+    FROM admin_sessions s
+    JOIN admin_accounts a ON a.id = s.admin_account_id
+    WHERE s.token_hash = ? AND s.expires_at > datetime('now')
+    LIMIT 1
+  `).bind(hash).first();
+
+  if (session && session.status === 'active') {
+    return {
+      id: Number(session.admin_account_id),
+      label: session.label,
+      roleLevel: Number(session.role_level || 1),
+      owner: true,
+      session: true
+    };
+  }
+
+  const account = await env.users_db.prepare(`
+    SELECT id, label, role_level, status, is_builtin
+    FROM admin_accounts
+    WHERE token_hash = ?
+    LIMIT 1
+  `).bind(hash).first();
+
+  if (!account || account.status !== 'active') return null;
+
+  const roleLevel = Number(account.role_level || 1);
+  return {
+    id: Number(account.id),
+    label: account.label,
+    roleLevel,
+    owner: roleLevel >= ADMIN_ROLE_LEVELS.owner,
+    session: false
+  };
+}
+
+async function requireAdmin(request, env, minimumRole = 1, ownerOnly = false) {
+  const admin = await getAdminIdentity(request, env);
+  if (!admin) return { error: adminUnauthorized() };
+  if (ownerOnly ? !admin.owner : admin.roleLevel < minimumRole) {
+    return { error: adminForbidden() };
+  }
+  return { admin };
+}
+
+async function recordAdminLogin(env, adminId, request) {
+  await env.users_db.batch([
+    env.users_db.prepare(`
+      UPDATE admin_accounts
+      SET last_login_at = CURRENT_TIMESTAMP,
+          login_count = login_count + 1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).bind(adminId),
+    env.users_db.prepare(`
+      INSERT INTO admin_login_events (admin_account_id, ip, user_agent)
+      VALUES (?, ?, ?)
+    `).bind(
+      adminId,
+      request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || null,
+      request.headers.get('User-Agent') || ''
+    )
+  ]);
+}
+
+async function adminLogin(request, env) {
+  const token = (request.headers.get('X-Admin-Token') || ((await readJson(request)) || {}).token || '').trim();
+  if (!token) return adminUnauthorized();
+
+  const rate = await takeRateLimit(env, clientKey(request, 'admin-login'), 20, 5 * 60 * 1000);
+  if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
+
+  const admin = await getAdminIdentity(request, env);
+  if (!admin) return fail('unauthorized', 401, 'توکن مدیریت نامعتبر یا غیرفعال است.');
+
+  await recordAdminLogin(env, admin.id, request);
+  return json({
+    success: true,
+    admin: {
+      id: admin.id,
+      label: admin.label,
+      roleLevel: admin.roleLevel,
+      owner: admin.owner
+    }
+  });
+}
+
+async function adminValidate(request, env) {
+  const admin = await getAdminIdentity(request, env);
+  if (!admin) return adminUnauthorized();
+
+  return json({
+    success: true,
+    admin: {
+      id: admin.id,
+      label: admin.label,
+      roleLevel: admin.roleLevel,
+      owner: admin.owner
+    }
+  });
+}
+
+async function adminOwnerLogin(request, env) {
+  const body = await readJson(request);
+  const keyword = typeof (body && body.keyword) === 'string' ? body.keyword : '';
+  const rate = await takeRateLimit(env, clientKey(request, 'admin-owner-login'), 5, 10 * 60 * 1000);
+  if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
+
+  const expectedHash = String(env.OWNER_ADMIN_KEYWORD_HASH || OWNER_ADMIN_KEYWORD_HASH).trim();
+  const suppliedHash = await sha256Hex(keyword);
+  if (!keyword || suppliedHash !== expectedHash) {
+    return fail('unauthorized', 401, 'کلید ویژه مالک نامعتبر است.');
+  }
+
+  await ensureAdminTables(env);
+  const master = await env.users_db.prepare(
+    'SELECT id, label FROM admin_accounts WHERE is_builtin = 1 LIMIT 1'
+  ).first();
+  if (!master) return fail('owner_unavailable', 503, MSG.server);
+
+  const sessionToken = randomId(32);
+  const sessionHash = await sha256Hex(sessionToken);
+
+  await env.users_db.prepare(`
+    INSERT INTO admin_sessions (token_hash, admin_account_id, expires_at)
+    VALUES (?, ?, datetime('now', ?))
+  `).bind(sessionHash, master.id, OWNER_SESSION_TTL).run();
+
+  await recordAdminLogin(env, master.id, request);
+
+  return json({
+    success: true,
+    token: sessionToken,
+    admin: {
+      id: master.id,
+      label: master.label,
+      roleLevel: 100,
+      owner: true,
+      expiresIn: OWNER_SESSION_TTL
+    }
+  });
+}
+
+async function adminListAdministrators(request, env) {
+  const auth = await requireAdmin(request, env, ADMIN_ROLE_LEVELS.owner, true);
+  if (auth.error) return auth.error;
+
+  await ensureAdminTables(env);
+  const { results } = await env.users_db.prepare(`
+    SELECT id, label, role_level, status, is_builtin, created_at, updated_at, last_login_at, login_count
+    FROM admin_accounts
+    ORDER BY is_builtin DESC, id ASC
+  `).all();
+
+  return json({
+    success: true,
+    administrators: (results || []).map((r) => ({
+      id: Number(r.id),
+      label: r.label,
+      roleLevel: Number(r.role_level || 1),
+      status: r.status,
+      builtin: !!r.is_builtin,
+      createdAt: r.created_at || null,
+      updatedAt: r.updated_at || null,
+      lastLoginAt: r.last_login_at || null,
+      loginCount: Number(r.login_count || 0)
+    }))
+  });
+}
+
+async function adminCreateAdministrator(request, env) {
+  const auth = await requireAdmin(request, env, ADMIN_ROLE_LEVELS.owner, true);
+  if (auth.error) return auth.error;
+
+  const body = await readJson(request);
+  const label = String(body && body.label || '').trim().slice(0, 80);
+  const roleLevel = Number.parseInt(body && body.roleLevel, 10);
+
+  if (!label) return fail('invalid_label', 400, 'برای ادمین جدید یک نام وارد کن.');
+  if (![1, 2, 3].includes(roleLevel)) return fail('invalid_role', 400, 'سطح دسترسی باید بین ۱ تا ۳ باشد.');
+
+  await ensureAdminTables(env);
+  const countRow = await env.users_db.prepare('SELECT COUNT(*) AS n FROM admin_accounts WHERE is_builtin = 0').first();
+  if (Number(countRow?.n || 0) >= 100) return fail('admin_limit_reached', 409, 'تعداد ادمین‌ها به حد مجاز رسیده است.');
+
+  const token = randomId(32);
+  const tokenHash = await sha256Hex(token);
+
+  try {
+    const result = await env.users_db.prepare(`
+      INSERT INTO admin_accounts (label, token_hash, role_level, status, is_builtin)
+      VALUES (?, ?, ?, 'active', 0)
+    `).bind(label, tokenHash, roleLevel).run();
+
+    const id = Number(result.meta?.last_row_id || 0);
+    return json({
+      success: true,
+      admin: { id, label, roleLevel, status: 'active', builtin: false, loginCount: 0, lastLoginAt: null },
+      token
+    });
+  } catch (e) {
+    console.error('admin_create_failed', e);
+    return fail('admin_create_failed', 500, MSG.server);
+  }
+}
+
+async function adminSetAdministratorRole(request, env, adminId) {
+  const auth = await requireAdmin(request, env, ADMIN_ROLE_LEVELS.owner, true);
+  if (auth.error) return auth.error;
+  const body = await readJson(request);
+  const roleLevel = Number.parseInt(body && body.roleLevel, 10);
+  if (![1, 2, 3].includes(roleLevel)) return fail('invalid_role', 400, 'سطح دسترسی باید بین ۱ تا ۳ باشد.');
+
+  const target = await env.users_db.prepare('SELECT id, is_builtin FROM admin_accounts WHERE id = ?').bind(adminId).first();
+  if (!target) return fail('admin_not_found', 404, 'ادمین پیدا نشد.');
+  if (target.is_builtin) return fail('builtin_protected', 409, 'سطح دسترسی مالک اصلی قابل کاهش نیست.');
+
+  await env.users_db.prepare(`
+    UPDATE admin_accounts SET role_level = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+  `).bind(roleLevel, adminId).run();
+
+  return json({ success: true, roleLevel });
+}
+
+async function adminSetAdministratorStatus(request, env, adminId) {
+  const auth = await requireAdmin(request, env, ADMIN_ROLE_LEVELS.owner, true);
+  if (auth.error) return auth.error;
+  const body = await readJson(request);
+  const status = String(body && body.status || '');
+  if (!['active', 'disabled'].includes(status)) return fail('invalid_status', 400, 'وضعیت ادمین نامعتبر است.');
+
+  const target = await env.users_db.prepare('SELECT id, is_builtin FROM admin_accounts WHERE id = ?').bind(adminId).first();
+  if (!target) return fail('admin_not_found', 404, 'ادمین پیدا نشد.');
+  if (target.is_builtin) return fail('builtin_protected', 409, 'مالک اصلی را نمی‌توان غیرفعال کرد.');
+
+  await env.users_db.prepare('UPDATE admin_accounts SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').bind(status, adminId).run();
+  if (status === 'disabled') {
+    await env.users_db.prepare('DELETE FROM admin_sessions WHERE admin_account_id = ?').bind(adminId).run();
+  }
+
+  return json({ success: true, status });
+}
+
+async function adminDeleteAdministrator(request, env, adminId) {
+  const auth = await requireAdmin(request, env, ADMIN_ROLE_LEVELS.owner, true);
+  if (auth.error) return auth.error;
+
+  const target = await env.users_db.prepare('SELECT id, is_builtin FROM admin_accounts WHERE id = ?').bind(adminId).first();
+  if (!target) return fail('admin_not_found', 404, 'ادمین پیدا نشد.');
+  if (target.is_builtin) return fail('builtin_protected', 409, 'مالک اصلی را نمی‌توان حذف کرد.');
+
+  await env.users_db.batch([
+    env.users_db.prepare('DELETE FROM admin_sessions WHERE admin_account_id = ?').bind(adminId),
+    env.users_db.prepare('DELETE FROM admin_login_events WHERE admin_account_id = ?').bind(adminId),
+    env.users_db.prepare('DELETE FROM admin_accounts WHERE id = ?').bind(adminId)
+  ]);
+
+  return json({ success: true });
+}
 
  async function adminListUsers(request, env) {
    const url = new URL(request.url);
@@ -579,14 +921,44 @@ export default {
       if (path === '/api/auth/me' && method === 'GET') return await me(request, env);
       if (path === '/api/auth/logout' && method === 'POST') return await logout(request, env);
 
-      // ----- owner admin endpoints -----
-      if (path.startsWith('/api/admin/')) {
-        if (!isOwnerAdmin(request, env)) return adminUnauthorized();
+      // ----- owner/admin endpoints -----
+      if (path === '/api/admin/login' && method === 'POST') {
+        return await adminLogin(request, env);
+      }
+      if (path === '/api/admin/validate' && method === 'POST') {
+        return await adminValidate(request, env);
+      }
+      if (path === '/api/admin/owner/login' && method === 'POST') {
+        return await adminOwnerLogin(request, env);
+      }
 
-        if (path === '/api/admin/login' && method === 'POST') {
-          return json({ success: true });
+      if (path.startsWith('/api/admin/')) {
+        if (path === '/api/admin/administrators' && method === 'GET') {
+          return await adminListAdministrators(request, env);
         }
+        if (path === '/api/admin/administrators' && method === 'POST') {
+          return await adminCreateAdministrator(request, env);
+        }
+
+        const adminId = parseAdminAccountId(path);
+        if (adminId !== null) {
+          if (path === `/api/admin/administrators/${adminId}/role` && method === 'POST') {
+            return await adminSetAdministratorRole(request, env, adminId);
+          }
+          if (path === `/api/admin/administrators/${adminId}/status` && method === 'POST') {
+            return await adminSetAdministratorStatus(request, env, adminId);
+          }
+          if (path === `/api/admin/administrators/${adminId}` && method === 'DELETE') {
+            return await adminDeleteAdministrator(request, env, adminId);
+          }
+          return fail('not_found', 404, MSG.notFound);
+        }
+
+        const auth = await getAdminIdentity(request, env);
+        if (!auth) return adminUnauthorized();
+
         if (path === '/api/admin/users' && method === 'GET') {
+          if (auth.roleLevel < ADMIN_ROLE_LEVELS.viewer) return adminForbidden();
           return await adminListUsers(request, env);
         }
 
@@ -594,16 +966,20 @@ export default {
         if (!userId) return fail('not_found', 404, MSG.notFound);
 
         if (path === `/api/admin/users/${encodeURIComponent(userId)}` && method === 'GET') {
+          if (auth.roleLevel < ADMIN_ROLE_LEVELS.viewer) return adminForbidden();
           return await adminUserDetail(request, env, userId);
         }
         if (path === `/api/admin/users/${encodeURIComponent(userId)}/status` && method === 'POST') {
+          if (auth.roleLevel < ADMIN_ROLE_LEVELS.admin) return adminForbidden();
           const body = await readJson(request);
           return await adminSetUserStatus(env, userId, body && body.status);
         }
         if (path === `/api/admin/users/${encodeURIComponent(userId)}/revoke-sessions` && method === 'POST') {
+          if (auth.roleLevel < ADMIN_ROLE_LEVELS.admin) return adminForbidden();
           return await adminRevokeSessions(env, userId);
         }
         if (path === `/api/admin/users/${encodeURIComponent(userId)}/recovery/regenerate` && method === 'POST') {
+          if (auth.roleLevel < ADMIN_ROLE_LEVELS.admin) return adminForbidden();
           return await adminRegenerateRecovery(env, userId);
         }
 
