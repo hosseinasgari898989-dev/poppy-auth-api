@@ -52,7 +52,8 @@ const MSG = {
   badRecovery: 'کد بازیابی درست نیست. با دقت دوباره وارد کن.',
   passwordRequired: 'رمز حساب را وارد کن.',
   passwordMismatch: 'رمز و تکرار رمز یکسان نیستند.',
-  passwordInvalidLength: 'رمز حساب باید بین ۸ تا ۱۲۸ کاراکتر باشد.',
+  passwordInvalidLength: 'رمز حساب باید بین ۱۰ تا ۱۲۸ کاراکتر باشد.',
+  passwordWeak: 'رمز باید حداقل یک حرف بزرگ، یک حرف کوچک، یک عدد و یک نماد داشته باشد.',
   passwordAlreadySet: 'رمز حساب قبلاً تنظیم شده است.',
   passwordInvalid: 'رمز حساب درست نیست.',
   passwordNotSet: 'برای این حساب هنوز رمز عبور تنظیم نشده است.',
@@ -251,7 +252,7 @@ async function sha256Hex(text) {
 }
 
 const PASSWORD_ITERATIONS = 120000;
-const PASSWORD_MIN_LENGTH = 8;
+const PASSWORD_MIN_LENGTH = 10;
 const PASSWORD_MAX_LENGTH = 128;
 
 async function ensureAccountSecurityTables(env) {
@@ -280,6 +281,7 @@ function validatePasswordInput(password, confirm) {
   if (!p || !c) return { error: 'passwordRequired' };
   if (p.length < PASSWORD_MIN_LENGTH || p.length > PASSWORD_MAX_LENGTH) return { error: 'passwordInvalidLength' };
   if (p !== c) return { error: 'passwordMismatch' };
+  if (!/[A-Z]/.test(p) || !/[a-z]/.test(p) || !/[0-9]/.test(p) || !/[^A-Za-z0-9]/.test(p)) return { error: 'passwordWeak' };
   return null;
 }
 
