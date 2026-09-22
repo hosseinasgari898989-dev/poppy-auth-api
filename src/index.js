@@ -50,6 +50,13 @@ const MSG = {
   disabled: 'این حساب غیرفعال شده است.',
   notLoggedIn: 'وارد نشده‌ای یا مدت نشست تمام شده. دوباره وارد شو.',
   badRecovery: 'کد بازیابی درست نیست. با دقت دوباره وارد کن.',
+  passwordRequired: 'رمز حساب را وارد کن.',
+  passwordMismatch: 'رمز و تکرار رمز یکسان نیستند.',
+  passwordInvalidLength: 'رمز حساب باید بین ۸ تا ۱۲۸ کاراکتر باشد.',
+  passwordAlreadySet: 'رمز حساب قبلاً تنظیم شده است.',
+  passwordInvalid: 'رمز حساب درست نیست.',
+  passwordNotSet: 'برای این حساب هنوز رمز عبور تنظیم نشده است.',
+  recoveryCodeUnavailable: 'کد بازیابی قابل نمایش نیست. ابتدا امنیت حساب را کامل کن.',
   registrationClosed: 'ثبت‌نام حساب جدید بسته است. با حساب موجود وارد شو و از گزینه افزودن دستگاه استفاده کن.',
   googleNotConfigured: 'ورود با Google هنوز در سرور تنظیم نشده است.',
   googleInvalid: 'حساب Google قابل تأیید نبود. دوباره انتخابش کن.',
@@ -241,6 +248,73 @@ async function sha256Hex(text) {
   let hex = '';
   for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, '0');
   return hex;
+}
+
+const PASSWORD_ITERATIONS = 120000;
+const PASSWORD_MIN_LENGTH = 8;
+const PASSWORD_MAX_LENGTH = 128;
+
+async function ensureAccountSecurityTables(env) {
+  await env.users_db.batch([
+    env.users_db.prepare(`CREATE TABLE IF NOT EXISTS account_passwords (
+      user_id INTEGER PRIMARY KEY,
+      salt TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      iterations INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`),
+    env.users_db.prepare(`CREATE TABLE IF NOT EXISTS recovery_code_secrets (
+      user_id INTEGER PRIMARY KEY,
+      iv TEXT NOT NULL,
+      ciphertext TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`)
+  ]);
+}
+
+function validatePasswordInput(password, confirm) {
+  const p = typeof password === 'string' ? password : '';
+  const c = typeof confirm === 'string' ? confirm : '';
+  if (!p || !c) return { error: 'passwordRequired' };
+  if (p.length < PASSWORD_MIN_LENGTH || p.length > PASSWORD_MAX_LENGTH) return { error: 'passwordInvalidLength' };
+  if (p !== c) return { error: 'passwordMismatch' };
+  return null;
+}
+
+function randomSaltB64(bytes = 16) { return b64uEncode(crypto.getRandomValues(new Uint8Array(bytes))); }
+
+async function derivePasswordHash(password, saltB64, iterations = PASSWORD_ITERATIONS) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: b64uDecode(saltB64), iterations, hash: 'SHA-256' }, base, 256);
+  return b64uEncode(new Uint8Array(bits));
+}
+
+async function deriveRecoveryKey(password, saltB64, iterations) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: b64uDecode(saltB64), iterations, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+
+async function encryptRecoveryCode(password, saltB64, iterations, code) {
+  const key = await deriveRecoveryKey(password, saltB64, iterations);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(code));
+  return { iv: b64uEncode(iv), ciphertext: b64uEncode(new Uint8Array(ciphertext)) };
+}
+
+async function decryptRecoveryCode(password, saltB64, iterations, ivB64, ciphertextB64) {
+  const key = await deriveRecoveryKey(password, saltB64, iterations);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64uDecode(ivB64) }, key, b64uDecode(ciphertextB64));
+  return new TextDecoder().decode(plain);
+}
+
+async function preparePasswordPackage(password, recoveryCode) {
+  const salt = randomSaltB64();
+  const iterations = PASSWORD_ITERATIONS;
+  const passwordHash = await derivePasswordHash(password, salt, iterations);
+  const secret = await encryptRecoveryCode(password, salt, iterations, recoveryCode);
+  return { salt, iterations, passwordHash, iv: secret.iv, ciphertext: secret.ciphertext };
 }
 
 // ==================================================
@@ -530,6 +604,8 @@ export default {
       if (path === '/api/auth/google/link' && method === 'POST') return await linkGoogle(request, env);
       if (path === '/api/auth/google/signup' && method === 'POST') return await googleSignup(request, env);
       if (path === '/api/auth/google/login' && method === 'POST') return await googleLogin(request, env);
+      if (path === '/api/auth/password/setup' && method === 'POST') return await passwordSetup(request, env);
+      if (path === '/api/auth/recovery/view' && method === 'POST') return await recoveryView(request, env);
       if (path === '/api/auth/register/begin' && method === 'POST') {
         ctx.waitUntil(cleanup(env).catch(() => {}));
         return await registerBegin(request, env);
@@ -598,6 +674,8 @@ export default {
 /* Google primary authentication: no mandatory WebAuthn */
 async function googleSignup(request, env) {
   const body = await readJson(request);
+  const passwordError = validatePasswordInput(body && body.password, body && body.passwordConfirm);
+  if (passwordError) return fail(passwordError.error, 400, MSG[passwordError.error] || MSG.generic);
   const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
   if (google.error) {
     return fail(
@@ -608,6 +686,7 @@ async function googleSignup(request, env) {
   }
 
   await ensureGoogleIdentityTables(env);
+  await ensureAccountSecurityTables(env);
 
   const rate = await takeRateLimit(env, 'google-signup:' + google.sub, 6, 10 * 60 * 1000);
   if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
@@ -625,44 +704,38 @@ async function googleSignup(request, env) {
     if (!exists) { displayId = id; break; }
   }
   if (!displayId) return fail('id_generation_failed', 500, MSG.server);
+  const recoveryCode = generateRecoveryCode();
+  const recoveryHash = await sha256Hex(normalizeRecoveryCode(recoveryCode));
+  const passwordPackage = await preparePasswordPackage(body.password, recoveryCode);
 
   try {
     await env.users_db.batch([
-      env.users_db
-        .prepare('INSERT INTO users (display_id, status, trust_level) VALUES (?, ?, ?)')
-        .bind(displayId, 'active', 'new'),
-      env.users_db
-        .prepare('INSERT INTO google_identities (user_id, google_sub, google_email) VALUES ((SELECT id FROM users WHERE display_id = ?), ?, ?)')
-        .bind(displayId, google.sub, google.email)
+      env.users_db.prepare('INSERT INTO users (display_id, status, trust_level) VALUES (?, ?, ?)').bind(displayId, 'active', 'new'),
+      env.users_db.prepare('INSERT INTO google_identities (user_id, google_sub, google_email) VALUES ((SELECT id FROM users WHERE display_id = ?), ?, ?)').bind(displayId, google.sub, google.email),
+      env.users_db.prepare('INSERT INTO account_passwords (user_id, salt, password_hash, iterations) VALUES ((SELECT id FROM users WHERE display_id = ?), ?, ?, ?)').bind(displayId, passwordPackage.salt, passwordPackage.passwordHash, passwordPackage.iterations),
+      env.users_db.prepare('INSERT INTO recovery_codes (user_id, code_hash) VALUES ((SELECT id FROM users WHERE display_id = ?), ?) ON CONFLICT(user_id) DO UPDATE SET code_hash = excluded.code_hash, created_at = CURRENT_TIMESTAMP').bind(displayId, recoveryHash),
+      env.users_db.prepare('INSERT INTO recovery_code_secrets (user_id, iv, ciphertext) VALUES ((SELECT id FROM users WHERE display_id = ?), ?, ?)').bind(displayId, passwordPackage.iv, passwordPackage.ciphertext)
     ]);
   } catch (e) {
-    const again = await env.users_db
-      .prepare('SELECT user_id FROM google_identities WHERE google_sub = ?')
-      .bind(google.sub)
-      .first();
+    const again = await env.users_db.prepare('SELECT user_id FROM google_identities WHERE google_sub = ?').bind(google.sub).first();
     if (again) return fail('google_account_exists', 409, MSG.googleAccountExists);
     console.error('google_signup_create_failed', e);
     return fail('user_create_failed', 500, MSG.server);
   }
 
-  const user = await env.users_db
-    .prepare('SELECT id, display_id FROM users WHERE display_id = ?')
-    .bind(displayId)
-    .first();
+  const user = await env.users_db.prepare('SELECT id, display_id FROM users WHERE display_id = ?').bind(displayId).first();
   if (!user) return fail('user_create_failed', 500, MSG.server);
 
   const token = await createSession(env, user.id, request);
-  const recoveryCode = await issueRecoveryCode(env, user.id);
-
   return json({
     success: true,
     token,
     user: { id: user.id, displayId: user.display_id },
-    recoveryCode,
+    passwordConfigured: true,
+    recoveryReady: true,
     googleLinked: true,
   });
 }
-
 async function googleLogin(request, env) {
   const body = await readJson(request);
   const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
@@ -908,6 +981,7 @@ async function linkGoogle(request, env) {
 async function me(request, env) {
   const s = await getSessionUser(request, env);
   if (s.error) return s.error;
+  await ensureAccountSecurityTables(env);
 
   const c = await env.users_db
     .prepare('SELECT COUNT(*) AS n FROM credentials WHERE user_id = ?')
@@ -924,14 +998,19 @@ async function me(request, env) {
   }
 
   let hasRecovery = false;
+  let passwordConfigured = false;
+  let recoveryReady = false;
   try {
-    const r = await env.users_db
-      .prepare('SELECT user_id FROM recovery_codes WHERE user_id = ?')
-      .bind(s.user.id)
-      .first();
+    const r = await env.users_db.prepare('SELECT user_id FROM recovery_codes WHERE user_id = ?').bind(s.user.id).first();
     hasRecovery = !!r;
+    const p = await env.users_db.prepare('SELECT user_id FROM account_passwords WHERE user_id = ?').bind(s.user.id).first();
+    passwordConfigured = !!p;
+    const rs = await env.users_db.prepare('SELECT user_id FROM recovery_code_secrets WHERE user_id = ?').bind(s.user.id).first();
+    recoveryReady = !!rs;
   } catch (e) {
     hasRecovery = false;
+    passwordConfigured = false;
+    recoveryReady = false;
   }
 
   return json({
@@ -942,6 +1021,8 @@ async function me(request, env) {
       status: s.user.status,
       credentialCount: (c && c.n) || 0,
       hasRecovery,
+      passwordConfigured,
+      recoveryReady,
       googleLinked,
     },
   });
@@ -958,7 +1039,75 @@ async function logout(request, env) {
 // ==================================================
 // 8) RECOVERY CODE (new)
 // ==================================================
-// login with recovery code; the used code is replaced by a new one
+// login with recovery code; the same code remains valid for this account
+async function passwordSetup(request, env) {
+  const s = await getSessionUser(request, env);
+  if (s.error) return s.error;
+  const rate = await takeRateLimit(env, 'password-setup:' + s.user.id, 4, 15 * 60 * 1000);
+  if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
+
+  const body = await readJson(request);
+  const passwordError = validatePasswordInput(body && body.password, body && body.passwordConfirm);
+  if (passwordError) return fail(passwordError.error, 400, MSG[passwordError.error] || MSG.generic);
+
+  await ensureAccountSecurityTables(env);
+  const existing = await env.users_db.prepare('SELECT user_id FROM account_passwords WHERE user_id = ?').bind(s.user.id).first();
+  if (existing) return fail('password_already_set', 409, MSG.passwordAlreadySet);
+
+  const recoveryCode = generateRecoveryCode();
+  const recoveryHash = await sha256Hex(normalizeRecoveryCode(recoveryCode));
+  const passwordPackage = await preparePasswordPackage(body.password, recoveryCode);
+
+  try {
+    await env.users_db.batch([
+      env.users_db.prepare('INSERT INTO account_passwords (user_id, salt, password_hash, iterations) VALUES (?, ?, ?, ?)').bind(s.user.id, passwordPackage.salt, passwordPackage.passwordHash, passwordPackage.iterations),
+      env.users_db.prepare('INSERT INTO recovery_codes (user_id, code_hash) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET code_hash = excluded.code_hash, created_at = CURRENT_TIMESTAMP').bind(s.user.id, recoveryHash),
+      env.users_db.prepare('INSERT INTO recovery_code_secrets (user_id, iv, ciphertext) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET iv = excluded.iv, ciphertext = excluded.ciphertext, updated_at = CURRENT_TIMESTAMP').bind(s.user.id, passwordPackage.iv, passwordPackage.ciphertext)
+    ]);
+  } catch (e) {
+    const again = await env.users_db.prepare('SELECT user_id FROM account_passwords WHERE user_id = ?').bind(s.user.id).first();
+    if (again) return fail('password_already_set', 409, MSG.passwordAlreadySet);
+    console.error('password_setup_failed', e);
+    return fail('server_error', 500, MSG.server);
+  }
+  return json({ success: true, passwordConfigured: true, recoveryReady: true });
+}
+
+async function recoveryView(request, env) {
+  const s = await getSessionUser(request, env);
+  if (s.error) return s.error;
+  const rate = await takeRateLimit(env, 'recovery-view:' + s.user.id, 8, 15 * 60 * 1000);
+  if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
+
+  const body = await readJson(request);
+  const password = body && typeof body.password === 'string' ? body.password : '';
+  if (!password) return fail('password_required', 400, MSG.passwordRequired);
+
+  await ensureAccountSecurityTables(env);
+  const pw = await env.users_db.prepare('SELECT salt, password_hash, iterations FROM account_passwords WHERE user_id = ?').bind(s.user.id).first();
+  if (!pw) return fail('password_not_set', 409, MSG.passwordNotSet);
+
+  const candidate = await derivePasswordHash(password, pw.salt, Number(pw.iterations) || PASSWORD_ITERATIONS);
+  if (candidate !== pw.password_hash) return fail('password_invalid', 401, MSG.passwordInvalid);
+
+  const secret = await env.users_db.prepare('SELECT iv, ciphertext FROM recovery_code_secrets WHERE user_id = ?').bind(s.user.id).first();
+  if (!secret) return fail('recovery_code_unavailable', 409, MSG.recoveryCodeUnavailable);
+
+  let recoveryCode;
+  try {
+    recoveryCode = await decryptRecoveryCode(password, pw.salt, Number(pw.iterations) || PASSWORD_ITERATIONS, secret.iv, secret.ciphertext);
+  } catch (e) {
+    console.error('recovery_decrypt_failed', e);
+    return fail('recovery_code_unavailable', 409, MSG.recoveryCodeUnavailable);
+  }
+
+  const hash = await sha256Hex(normalizeRecoveryCode(recoveryCode));
+  const stored = await env.users_db.prepare('SELECT code_hash FROM recovery_codes WHERE user_id = ?').bind(s.user.id).first();
+  if (!stored || stored.code_hash !== hash) return fail('recovery_code_unavailable', 409, MSG.recoveryCodeUnavailable);
+  return json({ success: true, recoveryCode, permanent: true });
+}
+
+
 async function recoveryLogin(request, env) {
   const rate = await guardRateLimit(request, env, 'recovery-login', 5, 15 * 60 * 1000);
   if (rate) return rate;
@@ -987,7 +1136,6 @@ async function recoveryLogin(request, env) {
   if (!user) return fail('user_not_found', 400, MSG.noUser);
   if (user.status !== 'active') return fail('account_disabled', 403, MSG.disabled);
 
-  const newCode = await issueRecoveryCode(env, user.id);
   await env.users_db
     .prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?')
     .bind(user.id)
@@ -998,7 +1146,7 @@ async function recoveryLogin(request, env) {
     success: true,
     token,
     user: { id: user.id, displayId: user.display_id },
-    recoveryCode: newCode,
+    recoveryReady: true,
   });
 }
 
