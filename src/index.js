@@ -566,11 +566,6 @@ async function registerBegin(request, env) {
   const origin = getOrigin(request);
   if (!origin) return fail('origin_not_allowed', 403, MSG.origin);
 
-  const countRow = await env.users_db.prepare('SELECT COUNT(*) AS count FROM users').first();
-  if (!countRow || Number(countRow.count || 0) > 0) {
-    return fail('registration_closed', 403, MSG.registrationClosed);
-  }
-
   const rpId = new URL(origin).hostname;
 
   // userID must be bytes (Uint8Array)
@@ -639,6 +634,9 @@ async function registerFinish(request, env) {
   const reg = extractRegistration(verification);
   if (!reg) return fail('bad_registration_info', 500, MSG.server);
 
+  const registrationDailyLimit = await guardRateLimit(request, env, 'register-success', 3, 24 * 60 * 60 * 1000);
+  if (registrationDailyLimit) return registrationDailyLimit;
+
   const dup = await env.users_db
     .prepare('SELECT credential_id FROM credentials WHERE credential_id = ?')
     .bind(reg.credentialIdB64)
@@ -658,9 +656,6 @@ async function registerFinish(request, env) {
     }
   }
   if (!displayId) return fail('id_generation_failed', 500, MSG.server);
-
-  const claimed = await claimInitialRegistration(env);
-  if (!claimed) return fail('registration_closed', 403, MSG.registrationClosed);
 
   const userAgent = request.headers.get('User-Agent') || '';
 
