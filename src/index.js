@@ -64,6 +64,60 @@ function fail(code, status = 400, message = '', extra = {}) {
   return json({ success: false, error: code, message: message || MSG.generic, ...extra }, status);
 }
 
+async function ensureUserSettingsTable(env) {
+  await env.users_db.prepare(`
+    CREATE TABLE IF NOT EXISTS user_settings (
+      user_id INTEGER NOT NULL,
+      setting_key TEXT NOT NULL,
+      setting_value TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, setting_key)
+    )
+  `).run();
+}
+
+async function getUserSettings(request, env) {
+  const s = await getSessionUser(request, env);
+  if (s.error) return s.error;
+  await ensureUserSettingsTable(env);
+  const rows = await env.users_db.prepare('SELECT setting_key, setting_value FROM user_settings WHERE user_id = ?').bind(s.user.id).all();
+  const settings = {};
+  for (const row of (rows.results || [])) settings[row.setting_key] = row.setting_value;
+  return json({ success: true, settings });
+}
+
+async function saveUserSetting(request, env) {
+  const s = await getSessionUser(request, env);
+  if (s.error) return s.error;
+
+  const rate = await takeRateLimit(env, 'user-settings:' + s.user.id, 60, 60 * 1000);
+  if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
+
+  const body = await readJson(request);
+  const key = String(body && body.key || '').trim();
+  const value = typeof (body && body.value) === 'string' ? body.value : String(body && body.value == null ? '' : body.value);
+
+  if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) return fail('setting_key_invalid', 400, MSG.settingKeyInvalid);
+  if (value.length > USER_SETTING_VALUE_MAX) return fail('setting_value_too_large', 413, MSG.settingValueTooLarge);
+
+  await ensureUserSettingsTable(env);
+  const exists = await env.users_db.prepare('SELECT 1 FROM user_settings WHERE user_id = ? AND setting_key = ?').bind(s.user.id, key).first();
+  if (!exists) {
+    const count = await env.users_db.prepare('SELECT COUNT(*) AS n FROM user_settings WHERE user_id = ?').bind(s.user.id).first();
+    if (Number((count && count.n) || 0) >= USER_SETTING_COUNT_MAX) return fail('setting_limit_reached', 409, MSG.settingLimitReached);
+  }
+
+  await env.users_db.prepare(`
+    INSERT INTO user_settings (user_id, setting_key, setting_value)
+    VALUES (?, ?, ?)
+    ON CONFLICT(user_id, setting_key) DO UPDATE SET
+      setting_value = excluded.setting_value,
+      updated_at = CURRENT_TIMESTAMP
+  `).bind(s.user.id, key, value).run();
+
+  return json({ success: true, key, value });
+}
+
 async function ensureGoogleIdentityTables(env) {
   await env.users_db.prepare('CREATE TABLE IF NOT EXISTS google_identities (user_id INTEGER PRIMARY KEY, google_sub TEXT NOT NULL UNIQUE, google_email TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)').run();
 }
@@ -475,6 +529,8 @@ export default {
       if (path === '/api/auth/google/login' && method === 'POST') return await googleLogin(request, env);
       if (path === '/api/auth/password/setup' && method === 'POST') return await passwordSetup(request, env);
       if (path === '/api/auth/recovery/view' && method === 'POST') return await recoveryView(request, env);
+      if (path === '/api/auth/settings' && method === 'GET') return await getUserSettings(request, env);
+      if (path === '/api/auth/settings' && method === 'PUT') return await saveUserSetting(request, env);
       if (path === '/api/auth/me' && method === 'GET') return await me(request, env);
       if (path === '/api/auth/logout' && method === 'POST') return await logout(request, env);
 
