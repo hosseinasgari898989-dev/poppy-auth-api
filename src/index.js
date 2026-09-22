@@ -1031,10 +1031,6 @@ export default {
 async function googleSignup(request, env) {
   const body = await readJson(request);
 
-  // Rate-limit by IP before calling Google's tokeninfo endpoint.
-  const ipRate = await guardRateLimit(request, env, 'google-signup-ip', 12, 10 * 60 * 1000);
-  if (ipRate) return ipRate;
-
   const passwordError = validatePasswordInput(body && body.password, body && body.passwordConfirm);
   if (passwordError) return fail(passwordError.error, 400, MSG[passwordError.error] || MSG.generic);
   const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
@@ -1125,10 +1121,6 @@ async function googleSignupCheck(request, env) {
 
 async function googleLogin(request, env) {
   const body = await readJson(request);
-
-  // Rate-limit by IP before calling Google's tokeninfo endpoint.
-  const ipRate = await guardRateLimit(request, env, 'google-login-ip', 20, 10 * 60 * 1000);
-  if (ipRate) return ipRate;
 
   const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
   if (google.error) {
