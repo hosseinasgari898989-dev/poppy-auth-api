@@ -14,12 +14,6 @@ const USER_SETTING_VALUE_MAX = 4096;
 const USER_SETTING_COUNT_MAX = 64;
 const GOOGLE_CLIENT_ID = '246560188376-prs0mf954qddb937v04s7krimjul9845.apps.googleusercontent.com';
 
-// Only these origins may register / login (no trailing slash).
-const ALLOWED_ORIGINS = [
-  'https://playtimechannelhv.github.io',
-  'https://hosseinasgari898989-dev.github.io',
-];
-
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
@@ -96,18 +90,6 @@ async function verifyGoogleIdToken(idToken, env) {
   }
 }
 
-async function saveGoogleRegistrationChallenge(env, data) {
-  await ensureGoogleIdentityTables(env);
-  await env.users_db.prepare("INSERT INTO google_registration_challenges (challenge_id, google_sub, google_email, google_name, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+10 minutes'))").bind(data.challengeId, data.googleSub, data.googleEmail, data.googleName || '').run();
-}
-
-async function takeGoogleRegistrationChallenge(env, challengeId) {
-  await ensureGoogleIdentityTables(env);
-  const row = await env.users_db.prepare("SELECT * FROM google_registration_challenges WHERE challenge_id = ? AND expires_at > datetime('now')").bind(challengeId).first();
-  if (row) await env.users_db.prepare('DELETE FROM google_registration_challenges WHERE challenge_id = ?').bind(challengeId).run();
-  return row;
-}
-
 function b64uEncode(input) {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
   let s = '';
@@ -125,10 +107,6 @@ function b64uDecode(str) {
 }
 
 // accepts string (already base64url) or bytes
-function toB64u(x) {
-  return typeof x === 'string' ? x : b64uEncode(x);
-}
-
 function randomId(bytes = 16) {
   return b64uEncode(crypto.getRandomValues(new Uint8Array(bytes)));
 }
@@ -311,35 +289,6 @@ async function preparePasswordPackage(password, recoveryCode) {
 // ==================================================
 // 3) DB HELPERS
 // ==================================================
-async function cleanup(env) {
-  await env.users_db.batch([
-    env.users_db.prepare("DELETE FROM challenges WHERE expires_at < datetime('now')"),
-    env.users_db.prepare("DELETE FROM sessions WHERE expires_at < datetime('now')"),
-    env.users_db.prepare("DELETE FROM google_registration_challenges WHERE expires_at < datetime('now')"),
-  ]);
-}
-
-async function saveChallenge(env, { id, userId, challenge, type, origin, rpId }) {
-  await env.users_db
-    .prepare(
-      "INSERT INTO challenges (id, user_id, challenge, type, origin, rp_id, expires_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?))"
-    )
-    .bind(id, userId, challenge, type, origin, rpId, CHALLENGE_TTL)
-    .run();
-}
-
-// single-use: fetch valid challenge then delete it
-async function takeChallenge(env, id, type) {
-  const ch = await env.users_db
-    .prepare("SELECT * FROM challenges WHERE id = ? AND type = ? AND expires_at > datetime('now')")
-    .bind(id, type)
-    .first();
-  if (ch) {
-    await env.users_db.prepare('DELETE FROM challenges WHERE id = ?').bind(id).run();
-  }
-  return ch;
-}
-
 async function createSession(env, userId, request) {
   const token = randomId(32);
   await env.users_db
@@ -384,35 +333,6 @@ async function issueRecoveryCode(env, userId) {
   }
 }
 
-// keep only hinted credential ids that really exist
-async function findKnownCredentialIds(env, ids) {
-  if (!Array.isArray(ids)) return [];
-  const clean = [
-    ...new Set(ids.filter((x) => typeof x === 'string' && /^[A-Za-z0-9_-]{16,1024}$/.test(x))),
-  ].slice(0, MAX_CREDENTIAL_HINTS);
-  if (!clean.length) return [];
-
-  const marks = clean.map(() => '?').join(',');
-  const res = await env.users_db
-    .prepare(`SELECT credential_id FROM credentials WHERE credential_id IN (${marks})`)
-    .bind(...clean)
-    .all();
-  return (res.results || []).map((r) => r.credential_id);
-}
-
-// works with both library layouts
-//  v11+ : info.credential = { id, publicKey, counter }
-//  v10  : info.credentialID, info.credentialPublicKey, info.counter
-function extractRegistration(verification) {
-  const info = verification && verification.registrationInfo;
-  if (!info) return null;
-  const rawId = info.credential ? info.credential.id : info.credentialID;
-  const rawKey = info.credential ? info.credential.publicKey : info.credentialPublicKey;
-  const counter = (info.credential ? info.credential.counter : info.counter) || 0;
-  if (!rawId || !rawKey) return null;
-  return { credentialIdB64: toB64u(rawId), publicKeyB64: toB64u(rawKey), counter };
-}
-
 // ==================================================
  // 3.5) OWNER ADMIN HELPERS
  // ==================================================
@@ -445,8 +365,7 @@ function extractRegistration(verification) {
        u.trust_level,
        u.last_login,
        u.created_at,
-       (SELECT COUNT(*) FROM credentials c WHERE c.user_id = u.id) AS credential_count,
-       (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > datetime('now')) AS active_session_count,
+         (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > datetime('now')) AS active_session_count,
        EXISTS(SELECT 1 FROM recovery_codes r WHERE r.user_id = u.id) AS has_recovery
      FROM users u
    `;
@@ -466,7 +385,6 @@ function extractRegistration(verification) {
      trustLevel: r.trust_level,
      lastLogin: r.last_login || null,
      createdAt: r.created_at || null,
-     credentialCount: Number(r.credential_count || 0),
      activeSessionCount: Number(r.active_session_count || 0),
      hasRecovery: !!r.has_recovery,
    }));
@@ -480,16 +398,6 @@ function extractRegistration(verification) {
      .first();
    if (!user) return fail('user_not_found', 404, MSG.noUser);
 
-   const creds = await env.users_db
-     .prepare('SELECT credential_id, counter, device_info, last_used FROM credentials WHERE user_id = ? ORDER BY credential_id ASC')
-     .bind(userId)
-     .all();
-
-   const sessions = await env.users_db
-     .prepare("SELECT token, expires_at, user_agent FROM sessions WHERE user_id = ? AND expires_at > datetime('now') ORDER BY expires_at DESC")
-     .bind(userId)
-     .all();
-
    return json({
      success: true,
      user: {
@@ -499,14 +407,7 @@ function extractRegistration(verification) {
        trustLevel: user.trust_level,
        lastLogin: user.last_login || null,
        createdAt: user.created_at || null,
-       credentialCount: (creds.results || []).length,
        activeSessionCount: (sessions.results || []).length,
-       credentials: (creds.results || []).map((r) => ({
-         credentialId: r.credential_id,
-         counter: r.counter || 0,
-         deviceInfo: r.device_info || '',
-         lastUsed: r.last_used || null,
-       })),
        sessions: (sessions.results || []).map((r) => ({
          expiresAt: r.expires_at || null,
          userAgent: r.user_agent || '',
@@ -534,30 +435,6 @@ function extractRegistration(verification) {
    if (!exists) return fail('user_not_found', 404, MSG.noUser);
    const result = await env.users_db.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId).run();
    return json({ success: true, count: Number((result.meta && result.meta.changes) || 0) });
- }
-
- async function adminRemoveCredential(env, userId, credentialId) {
-   const user = await env.users_db.prepare('SELECT id FROM users WHERE id = ?').bind(userId).first();
-   if (!user) return fail('user_not_found', 404, MSG.noUser);
-
-   const countRow = await env.users_db
-     .prepare('SELECT COUNT(*) AS n FROM credentials WHERE user_id = ?')
-     .bind(userId)
-     .first();
-   const count = Number((countRow && countRow.n) || 0);
-   if (count <= 1) {
-     return fail('last_credential', 400, 'برای امنیت، آخرین Passkey حذف نمی‌شود.');
-   }
-
-   const result = await env.users_db
-     .prepare('DELETE FROM credentials WHERE user_id = ? AND credential_id = ?')
-     .bind(userId, credentialId)
-     .run();
-
-   if (!result.meta || Number(result.meta.changes || 0) !== 1) {
-     return fail('credential_not_found', 404, 'Passkey پیدا نشد.');
-   }
-   return json({ success: true });
  }
 
  async function adminRegenerateRecovery(env, userId) {
@@ -598,18 +475,6 @@ export default {
       if (path === '/api/auth/google/login' && method === 'POST') return await googleLogin(request, env);
       if (path === '/api/auth/password/setup' && method === 'POST') return await passwordSetup(request, env);
       if (path === '/api/auth/recovery/view' && method === 'POST') return await recoveryView(request, env);
-      if (path === '/api/auth/register/begin' && method === 'POST') {
-        ctx.waitUntil(cleanup(env).catch(() => {}));
-        return await registerBegin(request, env);
-      }
-      if (path === '/api/auth/register/finish' && method === 'POST') return await registerFinish(request, env);
-
-      if (path === '/api/auth/login/begin' && method === 'POST') {
-        ctx.waitUntil(cleanup(env).catch(() => {}));
-        return await loginBegin(request, env);
-      }
-      if (path === '/api/auth/login/finish' && method === 'POST') return await loginFinish(request, env);
-
       if (path === '/api/auth/me' && method === 'GET') return await me(request, env);
       if (path === '/api/auth/logout' && method === 'POST') return await logout(request, env);
 
@@ -637,10 +502,6 @@ export default {
         if (path === `/api/admin/users/${encodeURIComponent(userId)}/revoke-sessions` && method === 'POST') {
           return await adminRevokeSessions(env, userId);
         }
-        if (path.startsWith(`/api/admin/users/${encodeURIComponent(userId)}/credentials/`) && method === 'DELETE') {
-          const credentialId = decodeURIComponent(path.split('/').pop() || '');
-          return await adminRemoveCredential(env, userId, credentialId);
-        }
         if (path === `/api/admin/users/${encodeURIComponent(userId)}/recovery/regenerate` && method === 'POST') {
           return await adminRegenerateRecovery(env, userId);
         }
@@ -648,11 +509,9 @@ export default {
         return fail('not_found', 404, MSG.notFound);
       }
 
-      // ----- new endpoints -----
+      // ----- recovery endpoints -----
       if (path === '/api/auth/recovery/login' && method === 'POST') return await recoveryLogin(request, env);
       if (path === '/api/auth/recovery/regenerate' && method === 'POST') return await recoveryRegenerate(request, env);
-      if (path === '/api/auth/credential/add/begin' && method === 'POST') return await addCredentialBegin(request, env);
-      if (path === '/api/auth/credential/add/finish' && method === 'POST') return await addCredentialFinish(request, env);
 
       return fail('not_found', 404, MSG.notFound);
     } catch (e) {
@@ -793,218 +652,12 @@ async function googleLogin(request, env) {
 }
 
 // ==================================================
-// 5) REGISTER
-// ==================================================
-
-async function registerBegin(request, env) {
-  const origin = getOrigin(request);
-  if (!origin) return fail('origin_not_allowed', 403, MSG.origin);
-  const body = await readJson(request);
-  const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
-  if (google.error) return fail(google.error, google.error === 'google_not_configured' ? 503 : 401, google.error === 'google_not_configured' ? MSG.googleNotConfigured : MSG.googleInvalid);
-  await ensureGoogleIdentityTables(env);
-  const existing = await env.users_db.prepare('SELECT user_id FROM google_identities WHERE google_sub = ?').bind(google.sub).first();
-  if (existing) return fail('google_account_exists', 409, MSG.googleAccountExists);
-  const rate = await takeRateLimit(env, 'register-google-begin:' + google.sub, 4, 10 * 60 * 1000);
-  if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
-  const rpId = new URL(origin).hostname;
-  const userHandle = crypto.getRandomValues(new Uint8Array(16));
-  const userHandleB64 = b64uEncode(userHandle);
-  const options = await generateRegistrationOptions({
-    rpName: RP_NAME,
-    rpID: rpId,
-    userID: userHandle,
-    userName: 'poppy-' + userHandleB64.slice(0, 6),
-    userDisplayName: google.name || google.email,
-    attestationType: 'none',
-    timeout: WEBAUTHN_TIMEOUT,
-    authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'preferred' },
-    supportedAlgorithmIDs: [-7, -257],
-  });
-  const challengeId = randomId(16);
-  await saveChallenge(env, { id: challengeId, userId: userHandleB64, challenge: options.challenge, type: 'register', origin, rpId });
-  await saveGoogleRegistrationChallenge(env, { challengeId, googleSub: google.sub, googleEmail: google.email, googleName: google.name });
-  return json({ success: true, options, challengeId });
-}
-
-async function registerFinish(request, env) {
-  const body = await readJson(request);
-  const { challengeId, credential } = body || {};
-  if (!challengeId || !credential) return fail('missing_fields', 400, MSG.fields);
-  const ch = await takeChallenge(env, challengeId, 'register');
-  if (!ch) return fail('challenge_not_found_or_expired', 400, MSG.challenge);
-  const googleCh = await takeGoogleRegistrationChallenge(env, challengeId);
-  if (!googleCh) return fail('invalid_google_credential', 401, MSG.googleInvalid);
-  const rate = await takeRateLimit(env, 'register-google-finish:' + googleCh.google_sub, 6, 10 * 60 * 1000);
-  if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
-  const existing = await env.users_db.prepare('SELECT user_id FROM google_identities WHERE google_sub = ?').bind(googleCh.google_sub).first();
-  if (existing) return fail('google_account_exists', 409, MSG.googleAccountExists);
-  let verification;
-  try {
-    verification = await verifyRegistrationResponse({ response: credential, expectedChallenge: ch.challenge, expectedOrigin: ch.origin, expectedRPID: ch.rp_id, requireUserVerification: true });
-  } catch (e) {
-    return fail('verification_failed: ' + e.message, 400, MSG.verify, { detail: e.message });
-  }
-  if (!verification.verified) return fail('not_verified', 400, MSG.verify);
-  const reg = extractRegistration(verification);
-  if (!reg) return fail('bad_registration_info', 500, MSG.server);
-  const dup = await env.users_db.prepare('SELECT credential_id FROM credentials WHERE credential_id = ?').bind(reg.credentialIdB64).first();
-  if (dup) return fail('credential_already_registered', 409, MSG.dup);
-  let displayId = null;
-  for (let i = 0; i < 10; i++) {
-    const id = generateDisplayId();
-    const exists = await env.users_db.prepare('SELECT id FROM users WHERE display_id = ?').bind(id).first();
-    if (!exists) { displayId = id; break; }
-  }
-  if (!displayId) return fail('id_generation_failed', 500, MSG.server);
-  const userAgent = request.headers.get('User-Agent') || '';
-  await env.users_db.batch([
-    env.users_db.prepare('INSERT INTO users (display_id, status, trust_level) VALUES (?, ?, ?)').bind(displayId, 'active', 'new'),
-    env.users_db.prepare('INSERT INTO credentials (credential_id, user_id, public_key, counter, device_info) VALUES (?, (SELECT id FROM users WHERE display_id = ?), ?, ?, ?)').bind(reg.credentialIdB64, displayId, reg.publicKeyB64, reg.counter, userAgent),
-    env.users_db.prepare('INSERT INTO google_identities (user_id, google_sub, google_email) VALUES ((SELECT id FROM users WHERE display_id = ?), ?, ?)').bind(displayId, googleCh.google_sub, googleCh.google_email)
-  ]);
-  const user = await env.users_db.prepare('SELECT id, display_id FROM users WHERE display_id = ?').bind(displayId).first();
-  if (!user) return fail('user_create_failed', 500, MSG.server);
-  const token = await createSession(env, user.id, request);
-  const recoveryCode = await issueRecoveryCode(env, user.id);
-  return json({ success: true, token, user: { id: user.id, displayId: user.display_id }, recoveryCode });
-}
-
-// ==================================================
-// 6) LOGIN
-// ==================================================
-async function loginBegin(request, env) {
-  const rate = await guardRateLimit(request, env, 'login-begin', 12, 10 * 60 * 1000);
-  if (rate) return rate;
-
-  const origin = getOrigin(request);
-  if (!origin) return fail('origin_not_allowed', 403, MSG.origin);
-  const rpId = new URL(origin).hostname;
-
-  // optional body: { credentialIds: [...] } remembered by the device
-  const body = await readJson(request);
-  const hinted = await findKnownCredentialIds(env, body && body.credentialIds);
-
-  const options = await generateAuthenticationOptions({
-    rpID: rpId,
-    userVerification: 'required',
-    timeout: WEBAUTHN_TIMEOUT,
-  });
-
-  // known ids -> explicit list (works on phones that reject an empty list)
-  // no ids     -> empty list (discoverable passkey)
-  if (hinted.length) {
-    options.allowCredentials = hinted.map((id) => ({ id, type: 'public-key' }));
-  }
-
-  const challengeId = randomId(16);
-  await saveChallenge(env, {
-    id: challengeId,
-    userId: '',
-    challenge: options.challenge,
-    type: 'login',
-    origin,
-    rpId,
-  });
-
-  return json({ success: true, options, challengeId });
-}
-
-async function loginFinish(request, env) {
-  const rate = await guardRateLimit(request, env, 'login-finish', 12, 60 * 1000);
-  if (rate) return rate;
-
-  const body = await readJson(request);
-  const { challengeId, credential } = body || {};
-  if (!challengeId || !credential || !credential.id) return fail('missing_fields', 400, MSG.fields);
-
-  const ch = await takeChallenge(env, challengeId, 'login');
-  if (!ch) return fail('challenge_not_found_or_expired', 400, MSG.challenge);
-
-  const storedCred = await env.users_db
-    .prepare('SELECT * FROM credentials WHERE credential_id = ?')
-    .bind(credential.id)
-    .first();
-  if (!storedCred) return fail('credential_not_found', 400, MSG.credNotFound);
-
-  const publicKeyBytes = b64uDecode(storedCred.public_key);
-  const storedCounter = storedCred.counter || 0;
-
-  let verification;
-  try {
-    verification = await verifyAuthenticationResponse({
-      response: credential,
-      expectedChallenge: ch.challenge,
-      expectedOrigin: ch.origin,
-      expectedRPID: ch.rp_id,
-      // v11+ reads "credential"
-      credential: {
-        id: storedCred.credential_id,
-        publicKey: publicKeyBytes,
-        counter: storedCounter,
-      },
-      // v10 reads "authenticator"
-      authenticator: {
-        credentialID: b64uDecode(storedCred.credential_id),
-        credentialPublicKey: publicKeyBytes,
-        counter: storedCounter,
-      },
-      requireUserVerification: true,
-    });
-  } catch (e) {
-    return fail('verification_failed: ' + e.message, 400, MSG.verify, { detail: e.message });
-  }
-  if (!verification.verified) return fail('not_verified', 400, MSG.verify);
-
-  const user = await env.users_db
-    .prepare('SELECT * FROM users WHERE id = ?')
-    .bind(storedCred.user_id)
-    .first();
-  if (!user) return fail('user_not_found', 400, MSG.noUser);
-  if (user.status !== 'active') return fail('account_disabled', 403, MSG.disabled);
-
-  await env.users_db.batch([
-    env.users_db
-      .prepare('UPDATE credentials SET counter = ?, last_used = CURRENT_TIMESTAMP WHERE credential_id = ?')
-      .bind(verification.authenticationInfo.newCounter || 0, storedCred.credential_id),
-    env.users_db
-      .prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?')
-      .bind(user.id),
-  ]);
-
-  const token = await createSession(env, user.id, request);
-
-  return json({ success: true, token, user: { id: user.id, displayId: user.display_id } });
-}
-
-async function linkGoogle(request, env) {
-  const session = await getSessionUser(request, env);
-  if (session.error) return session.error;
-  const body = await readJson(request);
-  const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
-  if (google.error) return fail(google.error, google.error === 'google_not_configured' ? 503 : 401, google.error === 'google_not_configured' ? MSG.googleNotConfigured : MSG.googleInvalid);
-  await ensureGoogleIdentityTables(env);
-  const existingForUser = await env.users_db.prepare('SELECT google_sub FROM google_identities WHERE user_id = ?').bind(session.user.id).first();
-  if (existingForUser && existingForUser.google_sub === google.sub) return json({ success: true, linked: true, alreadyLinked: true });
-  if (existingForUser) return fail('google_already_linked', 409, MSG.googleAlreadyLinked);
-  const existing = await env.users_db.prepare('SELECT user_id FROM google_identities WHERE google_sub = ?').bind(google.sub).first();
-  if (existing && String(existing.user_id) !== String(session.user.id)) return fail('google_account_exists', 409, MSG.googleAccountExists);
-  await env.users_db.prepare('INSERT INTO google_identities (user_id, google_sub, google_email) VALUES (?, ?, ?)').bind(session.user.id, google.sub, google.email).run();
-  return json({ success: true, linked: true, email: google.email });
-}
-
-// ==================================================
 // 7) SESSION (me / logout)
 // ==================================================
 async function me(request, env) {
   const s = await getSessionUser(request, env);
   if (s.error) return s.error;
   await ensureAccountSecurityTables(env);
-
-  const c = await env.users_db
-    .prepare('SELECT COUNT(*) AS n FROM credentials WHERE user_id = ?')
-    .bind(s.user.id)
-    .first();
 
   let googleLinked = false;
   try {
@@ -1037,7 +690,6 @@ async function me(request, env) {
       id: s.user.id,
       displayId: s.user.displayId,
       status: s.user.status,
-      credentialCount: (c && c.n) || 0,
       hasRecovery,
       passwordConfigured,
       recoveryReady,
@@ -1182,109 +834,4 @@ async function recoveryRegenerate(request, env) {
   return json({ success: true, recoveryCode: code });
 }
 
-// ==================================================
-// 9) ADD NEW DEVICE / PASSKEY (new, needs Bearer token)
-// ==================================================
-async function addCredentialBegin(request, env) {
-  const rate = await guardRateLimit(request, env, 'credential-add-begin', 5, 15 * 60 * 1000);
-  if (rate) return rate;
 
-  const s = await getSessionUser(request, env);
-  if (s.error) return s.error;
-
-  const origin = getOrigin(request);
-  if (!origin) return fail('origin_not_allowed', 403, MSG.origin);
-  const rpId = new URL(origin).hostname;
-
-  const existing = await env.users_db
-    .prepare('SELECT credential_id FROM credentials WHERE user_id = ?')
-    .bind(s.user.id)
-    .all();
-
-  const userHandle = crypto.getRandomValues(new Uint8Array(16));
-
-  const options = await generateRegistrationOptions({
-    rpName: RP_NAME,
-    rpID: rpId,
-    userID: userHandle,
-    userName: s.user.displayId,
-    userDisplayName: s.user.displayId,
-    attestationType: 'none',
-    timeout: WEBAUTHN_TIMEOUT,
-    authenticatorSelection: {
-      userVerification: 'required',
-      residentKey: 'preferred',
-    },
-    supportedAlgorithmIDs: [-7, -257],
-  });
-
-  // do not register the same authenticator twice
-  options.excludeCredentials = (existing.results || []).map((r) => ({
-    id: r.credential_id,
-    type: 'public-key',
-  }));
-
-  const challengeId = randomId(16);
-  await saveChallenge(env, {
-    id: challengeId,
-    userId: String(s.user.id),
-    challenge: options.challenge,
-    type: 'add',
-    origin,
-    rpId,
-  });
-
-  return json({ success: true, options, challengeId });
-}
-
-async function addCredentialFinish(request, env) {
-  const rate = await guardRateLimit(request, env, 'credential-add-finish', 8, 15 * 60 * 1000);
-  if (rate) return rate;
-
-  const s = await getSessionUser(request, env);
-  if (s.error) return s.error;
-
-  const body = await readJson(request);
-  const { challengeId, credential } = body || {};
-  if (!challengeId || !credential) return fail('missing_fields', 400, MSG.fields);
-
-  const ch = await takeChallenge(env, challengeId, 'add');
-  if (!ch || ch.user_id !== String(s.user.id)) {
-    return fail('challenge_not_found_or_expired', 400, MSG.challenge);
-  }
-
-  let verification;
-  try {
-    verification = await verifyRegistrationResponse({
-      response: credential,
-      expectedChallenge: ch.challenge,
-      expectedOrigin: ch.origin,
-      expectedRPID: ch.rp_id,
-      requireUserVerification: true,
-    });
-  } catch (e) {
-    return fail('verification_failed: ' + e.message, 400, MSG.verify, { detail: e.message });
-  }
-  if (!verification.verified) return fail('not_verified', 400, MSG.verify);
-
-  const reg = extractRegistration(verification);
-  if (!reg) return fail('bad_registration_info', 500, MSG.server);
-
-  const dup = await env.users_db
-    .prepare('SELECT credential_id FROM credentials WHERE credential_id = ?')
-    .bind(reg.credentialIdB64)
-    .first();
-  if (dup) return fail('credential_already_registered', 409, MSG.dup);
-
-  await env.users_db
-    .prepare('INSERT INTO credentials (credential_id, user_id, public_key, counter, device_info) VALUES (?, ?, ?, ?, ?)')
-    .bind(reg.credentialIdB64, s.user.id, reg.publicKeyB64, reg.counter, request.headers.get('User-Agent') || '')
-    .run();
-
-  const c = await env.users_db
-    .prepare('SELECT COUNT(*) AS n FROM credentials WHERE user_id = ?')
-    .bind(s.user.id)
-    .first();
-
-  return json({ success: true, credentialCount: (c && c.n) || 0 });
-}
