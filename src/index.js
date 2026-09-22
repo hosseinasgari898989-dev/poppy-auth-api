@@ -610,6 +610,7 @@ export default {
       }
       if (path === '/api/auth/google/link' && method === 'POST') return await linkGoogle(request, env);
       if (path === '/api/auth/google/signup' && method === 'POST') return await googleSignup(request, env);
+      if (path === '/api/auth/google/signup/check' && method === 'POST') return await googleSignupCheck(request, env);
       if (path === '/api/auth/google/login' && method === 'POST') return await googleLogin(request, env);
       if (path === '/api/auth/password/setup' && method === 'POST') return await passwordSetup(request, env);
       if (path === '/api/auth/recovery/view' && method === 'POST') return await recoveryView(request, env);
@@ -743,6 +744,32 @@ async function googleSignup(request, env) {
     googleLinked: true,
   });
 }
+async function googleSignupCheck(request, env) {
+  const body = await readJson(request);
+  const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
+  if (google.error) {
+    return fail(
+      google.error,
+      google.error === 'google_not_configured' ? 503 : 401,
+      google.error === 'google_not_configured' ? MSG.googleNotConfigured : MSG.googleInvalid
+    );
+  }
+
+  await ensureGoogleIdentityTables(env);
+
+  const rate = await takeRateLimit(env, 'google-signup-check:' + google.sub, 10, 10 * 60 * 1000);
+  if (!rate.allowed) return fail('rate_limited', 429, MSG.rateLimited, { retryAfter: rate.retryAfter });
+
+  const existing = await env.users_db
+    .prepare('SELECT user_id FROM google_identities WHERE google_sub = ?')
+    .bind(google.sub)
+    .first();
+
+  if (existing) return fail('google_account_exists', 409, MSG.googleAccountExists);
+
+  return json({ success: true, available: true });
+}
+
 async function googleLogin(request, env) {
   const body = await readJson(request);
   const google = await verifyGoogleIdToken(body && body.googleIdToken, env);
